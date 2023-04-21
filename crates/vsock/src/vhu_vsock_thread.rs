@@ -25,7 +25,7 @@ use crate::{
     rxops::*,
     thread_backend::*,
     vhu_vsock::{
-        ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT, CONN_TX_BUF_SIZE,
+        ConnMapKey, Error, Result, VhostUserVsockBackend, CONN_TX_BUF_SIZE,
         VSOCK_HOST_CID,
     },
     vsock_conn::*,
@@ -33,7 +33,41 @@ use crate::{
 
 type ArcVhostBknd = Arc<VhostUserVsockBackend>;
 
-pub(crate) struct VhostUserVsockThread {
+// New descriptors pending on the rx queue
+const RX_QUEUE_EVENT: u16 = 0;
+// New descriptors are pending on the tx queue.
+const TX_QUEUE_EVENT: u16 = 1;
+// New descriptors are pending on the event queue.
+const EVT_QUEUE_EVENT: u16 = 2;
+
+/// New descriptors pending on the Tx or Rx queue for which the thread is registered.
+/// For example, if the thread is registered for the Rx queue, then this event will
+/// be triggered when new descriptors are pending on the Rx queue.
+const THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT: u16 = 0;
+
+/// Notification coming from the backend.
+pub(crate) const BACKEND_EVENT: u16 = 3;
+
+pub trait VhostUserVsockThread {
+    fn set_event_idx(&mut self, enabled: bool);
+
+    fn update_memory(&mut self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>);
+
+    /// Set self's VringWorker.
+    fn set_vring_worker(
+        &mut self,
+        vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
+    );
+
+    fn handle_event(
+        &mut self,
+        device_event: u16,
+        evset: EventSet,
+        vrings: &[VringRwLock],
+    ) -> Result<bool>;
+}
+
+pub(crate) struct VhostUserVsockTxThread {
     /// Guest memory map.
     pub mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     /// VIRTIO_RING_F_EVENT_IDX.
@@ -49,7 +83,7 @@ pub(crate) struct VhostUserVsockThread {
     /// epoll fd to which new host connections are added.
     epoll_file: File,
     /// VsockThreadBackend instance.
-    pub thread_backend: VsockThreadBackend,
+    pub thread_backend: Arc<VsockThreadBackend>,
     /// CID of the guest.
     guest_cid: u64,
     /// Thread pool to handle event idx.
@@ -58,8 +92,8 @@ pub(crate) struct VhostUserVsockThread {
     local_port: Wrapping<u32>,
 }
 
-impl VhostUserVsockThread {
-    /// Create a new instance of VhostUserVsockThread.
+impl VhostUserVsockTxThread {
+    /// Create a new instance of VhostUserTxVsockThread.
     pub fn new(uds_path: String, guest_cid: u64) -> Result<Self> {
         // TODO: better error handling, maybe add a param to force the unlink
         let _ = std::fs::remove_file(uds_path.clone());
@@ -73,7 +107,7 @@ impl VhostUserVsockThread {
 
         let host_raw_fd = host_sock.as_raw_fd();
 
-        let thread = VhostUserVsockThread {
+        let thread = VhostUserVsockTxThread {
             mem: None,
             event_idx: false,
             host_sock: host_sock.as_raw_fd(),
@@ -81,7 +115,7 @@ impl VhostUserVsockThread {
             host_listener: host_sock,
             vring_worker: None,
             epoll_file,
-            thread_backend: VsockThreadBackend::new(uds_path, epoll_fd),
+            thread_backend: Arc::new(VsockThreadBackend::new(uds_path, epoll_fd)),
             guest_cid,
             pool: ThreadPoolBuilder::new()
                 .pool_size(1)
@@ -90,7 +124,7 @@ impl VhostUserVsockThread {
             local_port: Wrapping(0),
         };
 
-        VhostUserVsockThread::epoll_register(epoll_fd, host_raw_fd, epoll::Events::EPOLLIN)?;
+        VhostUserVsockTxThread::epoll_register(epoll_fd, host_raw_fd, epoll::Events::EPOLLIN)?;
 
         Ok(thread)
     }
@@ -139,19 +173,6 @@ impl VhostUserVsockThread {
         self.epoll_file.as_raw_fd()
     }
 
-    /// Set self's VringWorker.
-    pub fn set_vring_worker(
-        &mut self,
-        vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
-    ) {
-        self.vring_worker = vring_worker;
-        self.vring_worker
-            .as_ref()
-            .unwrap()
-            .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
-            .unwrap();
-    }
-
     /// Process a BACKEND_EVENT received by VhostUserVsockBackend.
     pub fn process_backend_evt(&mut self, _evset: EventSet) {
         let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 32];
@@ -159,7 +180,7 @@ impl VhostUserVsockThread {
             match epoll::wait(self.epoll_file.as_raw_fd(), 0, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for evt in epoll_events.iter().take(ev_cnt) {
-                        self.handle_event(
+                        self.handle_backend_event(
                             evt.data as RawFd,
                             epoll::Events::from_bits(evt.events).unwrap(),
                         );
@@ -178,7 +199,7 @@ impl VhostUserVsockThread {
 
     /// Handle a BACKEND_EVENT by either accepting a new connection or
     /// forwarding a request to the appropriate connection object.
-    fn handle_event(&mut self, fd: RawFd, evset: epoll::Events) {
+    fn handle_backend_event(&mut self, fd: RawFd, evset: epoll::Events) {
         if fd == self.host_sock {
             // This is a new connection initiated by an application running on the host
             self.host_listener
@@ -198,14 +219,14 @@ impl VhostUserVsockThread {
             // Check if the stream represented by fd has already established a
             // connection with the application running in the guest
             if let std::collections::hash_map::Entry::Vacant(_) =
-                self.thread_backend.listener_map.entry(fd)
+                self.thread_backend.listener_map.write().unwrap().entry(fd)
             {
                 // New connection from the host
                 if evset != epoll::Events::EPOLLIN {
                     // Has to be EPOLLIN as it was not connected previously
                     return;
                 }
-                let mut unix_stream = match self.thread_backend.stream_map.remove(&fd) {
+                let mut unix_stream = match self.thread_backend.stream_map.write().unwrap().remove(&fd) {
                     Some(uds) => uds,
                     None => {
                         warn!("Error while searching fd in the stream map");
@@ -233,7 +254,7 @@ impl VhostUserVsockThread {
 
                 // Insert the fd into the backend's maps
                 self.thread_backend
-                    .listener_map
+                    .listener_map.write().unwrap()
                     .insert(fd, ConnMapKey::new(local_port, peer_port));
 
                 // Create a new connection object an enqueue a connection request
@@ -251,10 +272,10 @@ impl VhostUserVsockThread {
                 new_conn.set_peer_port(peer_port);
 
                 // Add connection object into the backend's maps
-                self.thread_backend.conn_map.insert(conn_map_key, new_conn);
+                self.thread_backend.conn_map.write().unwrap().insert(conn_map_key, new_conn);
 
                 self.thread_backend
-                    .backend_rxq
+                    .backend_rxq.write().unwrap()
                     .push_back(ConnMapKey::new(local_port, peer_port));
 
                 // Re-register the fd to listen for EPOLLIN and EPOLLOUT events
@@ -266,8 +287,8 @@ impl VhostUserVsockThread {
                 .unwrap();
             } else {
                 // Previously connected connection
-                let key = self.thread_backend.listener_map.get(&fd).unwrap();
-                let conn = self.thread_backend.conn_map.get_mut(key).unwrap();
+                let key = self.thread_backend.listener_map.read().unwrap().get(&fd).unwrap();
+                let conn = self.thread_backend.conn_map.read().unwrap().get(key).unwrap().write().unwrap();
 
                 if evset == epoll::Events::EPOLLOUT {
                     // Flush any remaining data from the tx buffer
@@ -278,7 +299,7 @@ impl VhostUserVsockThread {
                                 conn.rx_queue.enqueue(RxOps::CreditUpdate);
                             }
                             self.thread_backend
-                                .backend_rxq
+                                .backend_rxq.write().unwrap()
                                 .push_back(ConnMapKey::new(conn.local_port, conn.peer_port));
                         }
                         Err(e) => {
@@ -295,7 +316,7 @@ impl VhostUserVsockThread {
                 // Enqueue a read request
                 conn.rx_queue.enqueue(RxOps::Rw);
                 self.thread_backend
-                    .backend_rxq
+                    .backend_rxq.write().unwrap()
                     .push_back(ConnMapKey::new(conn.local_port, conn.peer_port));
             }
         }
@@ -310,12 +331,12 @@ impl VhostUserVsockThread {
         loop {
             if !self
                 .thread_backend
-                .local_port_set
+                .local_port_set.read().unwrap()
                 .contains(&alloc_local_port)
             {
                 // The port set doesn't contain the newly allocated port number.
                 self.local_port = Wrapping(alloc_local_port + 1);
-                self.thread_backend.local_port_set.insert(alloc_local_port);
+                self.thread_backend.local_port_set.write().unwrap().insert(alloc_local_port);
                 return Ok(alloc_local_port);
             } else {
                 if alloc_local_port == self.local_port.0 {
@@ -370,113 +391,14 @@ impl VhostUserVsockThread {
     /// Add a stream to epoll to listen for EPOLLIN events.
     fn add_stream_listener(&mut self, stream: UnixStream) -> Result<()> {
         let stream_fd = stream.as_raw_fd();
-        self.thread_backend.stream_map.insert(stream_fd, stream);
-        VhostUserVsockThread::epoll_register(
+        self.thread_backend.stream_map.write().unwrap().insert(stream_fd, stream);
+        VhostUserVsockTxThread::epoll_register(
             self.get_epoll_fd(),
             stream_fd,
             epoll::Events::EPOLLIN,
         )?;
 
         Ok(())
-    }
-
-    /// Iterate over the rx queue and process rx requests.
-    fn process_rx_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
-        let mut used_any = false;
-        let atomic_mem = match &self.mem {
-            Some(m) => m,
-            None => return Err(Error::NoMemoryConfigured),
-        };
-
-        let mut vring_mut = vring.get_mut();
-
-        let queue = vring_mut.get_queue_mut();
-
-        while let Some(mut avail_desc) = queue
-            .iter(atomic_mem.memory())
-            .map_err(|_| Error::IterateQueue)?
-            .next()
-        {
-            used_any = true;
-            let mem = atomic_mem.clone().memory();
-
-            let head_idx = avail_desc.head_index();
-            let used_len = match VsockPacket::from_rx_virtq_chain(
-                mem.deref(),
-                &mut avail_desc,
-                CONN_TX_BUF_SIZE,
-            ) {
-                Ok(mut pkt) => {
-                    if self.thread_backend.recv_pkt(&mut pkt).is_ok() {
-                        PKT_HEADER_SIZE + pkt.len() as usize
-                    } else {
-                        queue.iter(mem).unwrap().go_to_previous_position();
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!("vsock: RX queue error: {:?}", e);
-                    0
-                }
-            };
-
-            let vring = vring.clone();
-            let event_idx = self.event_idx;
-
-            self.pool.spawn_ok(async move {
-                // TODO: Understand why doing the following in the pool works
-                if event_idx {
-                    if vring.add_used(head_idx, used_len as u32).is_err() {
-                        warn!("Could not return used descriptors to ring");
-                    }
-                    match vring.needs_notification() {
-                        Err(_) => {
-                            warn!("Could not check if queue needs to be notified");
-                            vring.signal_used_queue().unwrap();
-                        }
-                        Ok(needs_notification) => {
-                            if needs_notification {
-                                vring.signal_used_queue().unwrap();
-                            }
-                        }
-                    }
-                } else {
-                    if vring.add_used(head_idx, used_len as u32).is_err() {
-                        warn!("Could not return used descriptors to ring");
-                    }
-                    vring.signal_used_queue().unwrap();
-                }
-            });
-
-            if !self.thread_backend.pending_rx() {
-                break;
-            }
-        }
-        Ok(used_any)
-    }
-
-    /// Wrapper to process rx queue based on whether event idx is enabled or not.
-    pub fn process_rx(&mut self, vring: &VringRwLock, event_idx: bool) -> Result<bool> {
-        if event_idx {
-            // To properly handle EVENT_IDX we need to keep calling
-            // process_rx_queue until it stops finding new requests
-            // on the queue, as vm-virtio's Queue implementation
-            // only checks avail_index once
-            loop {
-                if !self.thread_backend.pending_rx() {
-                    break;
-                }
-                vring.disable_notification().unwrap();
-
-                self.process_rx_queue(vring)?;
-                if !vring.enable_notification().unwrap() {
-                    break;
-                }
-            }
-        } else {
-            self.process_rx_queue(vring)?;
-        }
-        Ok(false)
     }
 
     /// Process tx queue and send requests to the backend for processing.
@@ -576,7 +498,58 @@ impl VhostUserVsockThread {
     }
 }
 
-impl Drop for VhostUserVsockThread {
+impl VhostUserVsockThread for VhostUserVsockTxThread {
+    fn set_event_idx(&mut self, enabled: bool) {
+        self.event_idx = enabled;
+    }
+
+    fn update_memory(&mut self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>) {
+        self.mem = Some(atomic_mem);
+    }
+
+    fn set_vring_worker(
+        &mut self,
+        vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
+    ) {
+        self.vring_worker = vring_worker;
+        self.vring_worker
+            .as_ref()
+            .unwrap()
+            .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
+            .unwrap();
+    }
+
+    fn handle_event(
+        &mut self,
+        device_event: u16,
+        evset: EventSet,
+        vrings: &[VringRwLock],
+    ) -> Result<bool> {
+        let vring = &vrings[0];
+
+        if evset != EventSet::IN {
+            return Err(Error::HandleEventNotEpollIn.into());
+        }
+
+        match device_event {
+            THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT => {
+                self.process_tx(vring, self.event_idx)?;
+            }
+            EVT_QUEUE_EVENT => {}
+            BACKEND_EVENT => {
+                self.process_backend_event(evset);
+                self.process_tx(vring, self.event_idx)?;
+            }
+            _ => {
+                return Err(Error::HandleUnknownEvent.into());
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+impl Drop for VhostUserVsockTxThread {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.host_sock_path);
     }
@@ -588,7 +561,7 @@ mod tests {
     use vm_memory::GuestAddress;
     use vmm_sys_util::eventfd::EventFd;
 
-    impl VhostUserVsockThread {
+    impl VhostUserVsockTxThread {
         fn get_epoll_file(&self) -> &File {
             &self.epoll_file
         }
