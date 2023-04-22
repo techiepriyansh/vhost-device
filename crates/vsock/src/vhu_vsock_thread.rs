@@ -48,6 +48,49 @@ const THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT: u16 = 0;
 /// Notification coming from the backend.
 pub(crate) const BACKEND_EVENT: u16 = 3;
 
+pub struct EpollHelpers;
+
+impl EpollHelpers {
+    /// Register a file with an epoll to listen for events in evset.
+    pub fn epoll_register(epoll_fd: RawFd, fd: RawFd, evset: epoll::Events) -> Result<()> {
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            fd,
+            epoll::Event::new(evset, fd as u64),
+        )
+        .map_err(Error::EpollAdd)?;
+
+        Ok(())
+    }
+
+    /// Remove a file from the epoll.
+    pub fn epoll_unregister(epoll_fd: RawFd, fd: RawFd) -> Result<()> {
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_DEL,
+            fd,
+            epoll::Event::new(epoll::Events::empty(), 0),
+        )
+        .map_err(Error::EpollRemove)?;
+
+        Ok(())
+    }
+
+    /// Modify the events we listen to for the fd in the epoll.
+    pub fn epoll_modify(epoll_fd: RawFd, fd: RawFd, evset: epoll::Events) -> Result<()> {
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_MOD,
+            fd,
+            epoll::Event::new(evset, fd as u64),
+        )
+        .map_err(Error::EpollModify)?;
+
+        Ok(())
+    }
+}
+
 pub trait VhostUserVsockThread {
     fn set_event_idx(&mut self, enabled: bool);
 
@@ -124,48 +167,9 @@ impl VhostUserVsockTxThread {
             local_port: Wrapping(0),
         };
 
-        VhostUserVsockTxThread::epoll_register(epoll_fd, host_raw_fd, epoll::Events::EPOLLIN)?;
+        EpollHelpers::epoll_register(epoll_fd, host_raw_fd, epoll::Events::EPOLLIN)?;
 
         Ok(thread)
-    }
-
-    /// Register a file with an epoll to listen for events in evset.
-    pub fn epoll_register(epoll_fd: RawFd, fd: RawFd, evset: epoll::Events) -> Result<()> {
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            fd,
-            epoll::Event::new(evset, fd as u64),
-        )
-        .map_err(Error::EpollAdd)?;
-
-        Ok(())
-    }
-
-    /// Remove a file from the epoll.
-    pub fn epoll_unregister(epoll_fd: RawFd, fd: RawFd) -> Result<()> {
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_DEL,
-            fd,
-            epoll::Event::new(epoll::Events::empty(), 0),
-        )
-        .map_err(Error::EpollRemove)?;
-
-        Ok(())
-    }
-
-    /// Modify the events we listen to for the fd in the epoll.
-    pub fn epoll_modify(epoll_fd: RawFd, fd: RawFd, evset: epoll::Events) -> Result<()> {
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_MOD,
-            fd,
-            epoll::Event::new(evset, fd as u64),
-        )
-        .map_err(Error::EpollModify)?;
-
-        Ok(())
     }
 
     /// Return raw file descriptor of the epoll file.
@@ -279,7 +283,7 @@ impl VhostUserVsockTxThread {
                     .push_back(ConnMapKey::new(local_port, peer_port));
 
                 // Re-register the fd to listen for EPOLLIN and EPOLLOUT events
-                Self::epoll_modify(
+                EpollHelpers::epoll_modify(
                     self.get_epoll_fd(),
                     fd,
                     epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
@@ -311,7 +315,7 @@ impl VhostUserVsockTxThread {
 
                 // Unregister stream from the epoll, register when connection is
                 // established with the guest
-                Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();
+                EpollHelpers::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();
 
                 // Enqueue a read request
                 conn.rx_queue.enqueue(RxOps::Rw);
@@ -392,7 +396,7 @@ impl VhostUserVsockTxThread {
     fn add_stream_listener(&mut self, stream: UnixStream) -> Result<()> {
         let stream_fd = stream.as_raw_fd();
         self.thread_backend.stream_map.write().unwrap().insert(stream_fd, stream);
-        VhostUserVsockTxThread::epoll_register(
+        EpollHelpers::epoll_register(
             self.get_epoll_fd(),
             stream_fd,
             epoll::Events::EPOLLIN,

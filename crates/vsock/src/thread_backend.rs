@@ -19,7 +19,7 @@ use crate::{
         ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST, VSOCK_OP_RST,
         VSOCK_TYPE_STREAM,
     },
-    vhu_vsock_thread::VhostUserVsockThread,
+    vhu_vsock_thread::EpollHelpers,
     vsock_conn::*,
 };
 
@@ -83,7 +83,7 @@ impl VsockThreadBackend {
             self.listener_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.stream_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.local_port_set.write().unwrap().remove(&conn.local_port);
-            VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
+            EpollHelpers::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
@@ -161,7 +161,7 @@ impl VsockThreadBackend {
             self.listener_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.stream_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.local_port_set.write().unwrap().remove(&conn.local_port);
-            VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
+            EpollHelpers::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
@@ -231,7 +231,7 @@ impl VsockThreadBackend {
         );
         self.local_port_set.write().unwrap().insert(pkt.dst_port());
 
-        VhostUserVsockThread::epoll_register(
+        EpollHelpers::epoll_register(
             self.epoll_fd,
             stream_fd,
             epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
