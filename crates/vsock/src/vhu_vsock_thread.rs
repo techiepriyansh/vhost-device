@@ -554,6 +554,185 @@ impl Drop for VhostUserVsockTxThread {
         let _ = std::fs::remove_file(&self.host_sock_path);
     }
 }
+
+pub(crate) struct VhostUserVsockRxThread {
+    /// Guest memory map.
+    pub mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    /// VIRTIO_RING_F_EVENT_IDX.
+    pub event_idx: bool,
+    /// Instance of VringWorker.
+    vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
+    /// VsockThreadBackend instance.
+    pub thread_backend: Arc<VsockThreadBackend>,
+    /// Thread pool to handle event idx.
+    pool: ThreadPool,
+}
+
+impl VhostUserVsockRxThread {
+    pub fn new(thread_backend: Arc<VsockThreadBackend>) -> Result<Self> {
+        let thread = VhostUserVsockRxThread {
+            mem: None,
+            event_idx: false,
+            vring_worker: None,
+            thread_backend,
+            pool: ThreadPool::new()
+                .pool_size(1)
+                .create()
+                .map_err(Error::CreateThreadPool)?,
+        };
+
+        Ok(thread)
+    }
+
+    /// Iterate over the rx queue and process rx requests.
+    fn process_rx_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
+        let mut used_any = false;
+        let atomic_mem = match &self.mem {
+            Some(m) => m,
+            None => return Err(Error::NoMemoryConfigured),
+        };
+
+        let mut vring_mut = vring.get_mut();
+
+        let queue = vring_mut.get_queue_mut();
+
+        while let Some(mut avail_desc) = queue
+            .iter(atomic_mem.memory())
+            .map_err(|_| Error::IterateQueue)?
+            .next()
+        {
+            used_any = true;
+            let mem = atomic_mem.clone().memory();
+
+            let head_idx = avail_desc.head_index();
+            let used_len = match VsockPacket::from_rx_virtq_chain(
+                mem.deref(),
+                &mut avail_desc,
+                CONN_TX_BUF_SIZE,
+            ) {
+                Ok(mut pkt) => {
+                    if self.thread_backend.recv_pkt(&mut pkt).is_ok() {
+                        PKT_HEADER_SIZE + pkt.len() as usize
+                    } else {
+                        queue.iter(mem).unwrap().go_to_previous_position();
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("vsock: RX queue error: {:?}", e);
+                    0
+                }
+            };
+
+            let vring = vring.clone();
+            let event_idx = self.event_idx;
+
+            self.pool.spawn_ok(async move {
+                // TODO: Understand why doing the following in the pool works
+                if event_idx {
+                    if vring.add_used(head_idx, used_len as u32).is_err() {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    match vring.needs_notification() {
+                        Err(_) => {
+                            warn!("Could not check if queue needs to be notified");
+                            vring.signal_used_queue().unwrap();
+                        }
+                        Ok(needs_notification) => {
+                            if needs_notification {
+                                vring.signal_used_queue().unwrap();
+                            }
+                        }
+                    }
+                } else {
+                    if vring.add_used(head_idx, used_len as u32).is_err() {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    vring.signal_used_queue().unwrap();
+                }
+            });
+
+            if !self.thread_backend.pending_rx() {
+                break;
+            }
+        }
+        Ok(used_any)
+    }
+
+    /// Wrapper to process rx queue based on whether event idx is enabled or not.
+    pub fn process_rx(&mut self, vring: &VringRwLock, event_idx: bool) -> Result<bool> {
+        if event_idx {
+            // To properly handle EVENT_IDX we need to keep calling
+            // process_rx_queue until it stops finding new requests
+            // on the queue, as vm-virtio's Queue implementation
+            // only checks avail_index once
+            loop {
+                if !self.thread_backend.pending_rx() {
+                    break;
+                }
+                vring.disable_notification().unwrap();
+
+                self.process_rx_queue(vring)?;
+                if !vring.enable_notification().unwrap() {
+                    break;
+                }
+            }
+        } else {
+            self.process_rx_queue(vring)?;
+        }
+        Ok(false)
+    }
+}
+
+impl VhostUserVsockThread for VhostUserVsockRxThread {
+     fn set_event_idx(&mut self, enabled: bool) {
+        self.event_idx = enabled;
+    }
+
+    fn update_memory(&mut self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>) {
+        self.mem = Some(atomic_mem);
+    }
+
+    fn set_vring_worker(
+        &mut self,
+        vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
+    ) {
+        self.vring_worker = vring_worker;
+        self.vring_worker
+            .as_ref()
+            .unwrap()
+            .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
+            .unwrap();
+    }
+
+    fn handle_event(
+        &mut self,
+        device_event: u16,
+        evset: EventSet,
+        vrings: &[VringRwLock],
+    ) -> Result<bool> {
+        let vring = &vrings[0];
+
+        if evset != EventSet::IN {
+            return Err(Error::HandleEventNotEpollIn.into());
+        }
+
+        match device_event {
+            THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT => {
+                if self.thread_backend.pending_rx() {
+                    self.process_rx(vring, self.event_idx)?;
+                }
+            }
+            EVT_QUEUE_EVENT => {}
+            _ => {
+                return Err(Error::HandleUnknownEvent.into());
+            }
+        }
+
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
