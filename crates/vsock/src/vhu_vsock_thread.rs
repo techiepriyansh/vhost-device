@@ -5,12 +5,12 @@ use std::{
     io,
     io::Read,
     num::Wrapping,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     os::unix::{
         net::{UnixListener, UnixStream},
         prelude::{AsRawFd, FromRawFd, RawFd},
     },
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
@@ -91,7 +91,7 @@ impl EpollHelpers {
     }
 }
 
-pub trait VhostUserVsockThread {
+pub trait VhostUserVsockThread: Send {
     fn set_event_idx(&mut self, enabled: bool);
 
     fn update_memory(&mut self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>);
@@ -222,8 +222,7 @@ impl VhostUserVsockTxThread {
         } else {
             // Check if the stream represented by fd has already established a
             // connection with the application running in the guest
-            if let std::collections::hash_map::Entry::Vacant(_) =
-                self.thread_backend.listener_map.write().unwrap().entry(fd)
+            if !self.thread_backend.listener_map.read().unwrap().contains_key(&fd)
             {
                 // New connection from the host
                 if evset != epoll::Events::EPOLLIN {
@@ -276,7 +275,7 @@ impl VhostUserVsockTxThread {
                 new_conn.set_peer_port(peer_port);
 
                 // Add connection object into the backend's maps
-                self.thread_backend.conn_map.write().unwrap().insert(conn_map_key, new_conn);
+                self.thread_backend.conn_map.write().unwrap().insert(conn_map_key, RwLock::new(new_conn));
 
                 self.thread_backend
                     .backend_rxq.write().unwrap()
@@ -291,8 +290,13 @@ impl VhostUserVsockTxThread {
                 .unwrap();
             } else {
                 // Previously connected connection
-                let key = self.thread_backend.listener_map.read().unwrap().get(&fd).unwrap();
-                let conn = self.thread_backend.conn_map.read().unwrap().get(key).unwrap().write().unwrap();
+                let listener_map = self.thread_backend.listener_map.read().unwrap();
+                let conn_map = self.thread_backend.conn_map.read().unwrap();
+
+                let key = listener_map.get(&fd).unwrap();
+
+                let mut conn_guard = conn_map.get(key).unwrap().write().unwrap();
+                let conn = conn_guard.deref_mut();
 
                 if evset == epoll::Events::EPOLLOUT {
                     // Flush any remaining data from the tx buffer
@@ -541,7 +545,7 @@ impl VhostUserVsockThread for VhostUserVsockTxThread {
             }
             EVT_QUEUE_EVENT => {}
             BACKEND_EVENT => {
-                self.process_backend_event(evset);
+                self.process_backend_evt(evset);
                 self.process_tx(vring, self.event_idx)?;
             }
             _ => {
@@ -579,7 +583,7 @@ impl VhostUserVsockRxThread {
             event_idx: false,
             vring_worker: None,
             thread_backend,
-            pool: ThreadPool::new()
+            pool: ThreadPoolBuilder::new()
                 .pool_size(1)
                 .create()
                 .map_err(Error::CreateThreadPool)?,
@@ -702,11 +706,6 @@ impl VhostUserVsockThread for VhostUserVsockRxThread {
         vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
     ) {
         self.vring_worker = vring_worker;
-        self.vring_worker
-            .as_ref()
-            .unwrap()
-            .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
-            .unwrap();
     }
 
     fn handle_event(
