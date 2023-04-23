@@ -48,7 +48,7 @@ const THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT: u16 = 0;
 /// Notification coming from the backend.
 pub(crate) const BACKEND_EVENT: u16 = 3;
 
-pub struct EpollHelpers;
+pub(crate) struct EpollHelpers;
 
 impl EpollHelpers {
     /// Register a file with an epoll to listen for events in evset.
@@ -91,7 +91,7 @@ impl EpollHelpers {
     }
 }
 
-pub trait VhostUserVsockThread: Send {
+pub(crate) trait VhostUserVsockThread: Send {
     fn set_event_idx(&mut self, enabled: bool);
 
     fn update_memory(&mut self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>);
@@ -536,7 +536,7 @@ impl VhostUserVsockThread for VhostUserVsockTxThread {
         let vring = &vrings[0];
 
         if evset != EventSet::IN {
-            return Err(Error::HandleEventNotEpollIn.into());
+            return Err(Error::HandleEventNotEpollIn);
         }
 
         match device_event {
@@ -549,7 +549,7 @@ impl VhostUserVsockThread for VhostUserVsockTxThread {
                 self.process_tx(vring, self.event_idx)?;
             }
             _ => {
-                return Err(Error::HandleUnknownEvent.into());
+                return Err(Error::HandleUnknownEvent);
             }
         }
 
@@ -717,7 +717,7 @@ impl VhostUserVsockThread for VhostUserVsockRxThread {
         let vring = &vrings[0];
 
         if evset != EventSet::IN {
-            return Err(Error::HandleEventNotEpollIn.into());
+            return Err(Error::HandleEventNotEpollIn);
         }
 
         match device_event {
@@ -728,7 +728,7 @@ impl VhostUserVsockThread for VhostUserVsockRxThread {
             }
             EVT_QUEUE_EVENT => {}
             _ => {
-                return Err(Error::HandleUnknownEvent.into());
+                return Err(Error::HandleUnknownEvent);
             }
         }
 
