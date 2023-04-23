@@ -69,7 +69,8 @@ impl VsockThreadBackend {
     pub fn recv_pkt<B: BitmapSlice>(&self, pkt: &mut VsockPacket<B>) -> Result<()> {
         // Pop an event from the backend_rxq
         let key = self.backend_rxq.write().unwrap().pop_front().ok_or(Error::EmptyBackendRxQ)?;
-        let conn = match self.conn_map.read().unwrap().get(&key) {
+        let conn_map = self.conn_map.read().unwrap();
+        let conn = match conn_map.get(&key) {
             Some(conn) => conn,
             None => {
                 // assume that the connection does not exist
@@ -79,7 +80,9 @@ impl VsockThreadBackend {
 
         if conn.read().unwrap().rx_queue.peek() == Some(RxOps::Reset) {
             // Handle RST events here
-            let conn = self.conn_map.write().unwrap().remove(&key).unwrap().read().unwrap();
+            let conn_lock = self.conn_map.write().unwrap().remove(&key).unwrap();
+            let conn = conn_lock.read().unwrap();
+
             self.listener_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.stream_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.local_port_set.write().unwrap().remove(&conn.local_port);
@@ -153,11 +156,13 @@ impl VsockThreadBackend {
 
         if pkt.op() == VSOCK_OP_RST {
             // Handle an RST packet from the guest here
-            let conn = self.conn_map.read().unwrap().get(&key).unwrap();
+            let conn_map = self.conn_map.read().unwrap();
+            let conn = conn_map.get(&key).unwrap();
             if conn.read().unwrap().rx_queue.contains(RxOps::Reset.bitmask()) {
                 return Ok(());
             }
-            let conn = self.conn_map.write().unwrap().remove(&key).unwrap().read().unwrap();
+            let conn_lock = self.conn_map.write().unwrap().remove(&key).unwrap();
+            let conn = conn_lock.read().unwrap();
             self.listener_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.stream_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.local_port_set.write().unwrap().remove(&conn.local_port);
@@ -173,7 +178,8 @@ impl VsockThreadBackend {
         }
 
         // Forward this packet to its listening connection
-        let conn = self.conn_map.read().unwrap().get(&key).unwrap();
+        let conn_map = self.conn_map.read().unwrap();
+        let conn = conn_map.get(&key).unwrap();
         conn.write().unwrap().send_pkt(pkt)?;
 
         if conn.read().unwrap().rx_queue.pending_rx() {
