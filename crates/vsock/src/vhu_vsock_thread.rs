@@ -34,9 +34,9 @@ use crate::{
 type ArcVhostBknd = Arc<VhostUserVsockBackend>;
 
 // New descriptors pending on the rx queue
-const RX_QUEUE_EVENT: u16 = 0;
+// const RX_QUEUE_EVENT: u16 = 0;
 // New descriptors are pending on the tx queue.
-const TX_QUEUE_EVENT: u16 = 1;
+// const TX_QUEUE_EVENT: u16 = 1;
 // New descriptors are pending on the event queue.
 const EVT_QUEUE_EVENT: u16 = 2;
 
