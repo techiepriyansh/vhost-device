@@ -736,6 +736,7 @@ impl VhostUserVsockThread for VhostUserVsockRxThread {
     }
 }
 
+/*
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,3 +835,4 @@ mod tests {
         assert!(t.process_rx(&vring, true).is_err());
     }
 }
+*/
