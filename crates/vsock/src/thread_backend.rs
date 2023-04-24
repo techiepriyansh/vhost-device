@@ -6,7 +6,7 @@ use std::{
         net::UnixStream,
         prelude::{AsRawFd, FromRawFd, RawFd},
     },
-    sync::RwLock,
+    sync::{Arc, Mutex, RwLock},
 };
 
 use log::{info, warn};
@@ -27,7 +27,7 @@ pub(crate) struct VsockThreadBackend {
     /// Map of ConnMapKey objects indexed by raw file descriptors.
     pub listener_map: RwLock<HashMap<RawFd, ConnMapKey>>,
     /// Map of vsock connection objects indexed by ConnMapKey objects.
-    pub conn_map: RwLock<HashMap<ConnMapKey, RwLock<VsockConnection<UnixStream>>>>,
+    pub conn_map: RwLock<HashMap<ConnMapKey, Arc<Mutex<VsockConnection<UnixStream>>>>>,
     /// Queue of ConnMapKey objects indicating pending rx operations.
     pub backend_rxq: RwLock<VecDeque<ConnMapKey>>,
     /// Map of host-side unix streams indexed by raw file descriptors.
@@ -74,20 +74,18 @@ impl VsockThreadBackend {
             .unwrap()
             .pop_front()
             .ok_or(Error::EmptyBackendRxQ)?;
-        let conn_map = self.conn_map.read().unwrap();
-        let conn = match conn_map.get(&key) {
-            Some(conn) => conn,
+        let conn_mutex = match self.conn_map.read().unwrap().get(&key) {
+            Some(conn) => conn.clone(),
             None => {
                 // assume that the connection does not exist
                 return Ok(());
             }
         };
+        let mut conn = conn_mutex.lock().unwrap();
 
-        if conn.read().unwrap().rx_queue.peek() == Some(RxOps::Reset) {
+        if conn.rx_queue.peek() == Some(RxOps::Reset) {
             // Handle RST events here
-            let conn_lock = self.conn_map.write().unwrap().remove(&key).unwrap();
-            let conn = conn_lock.read().unwrap();
-
+            self.conn_map.write().unwrap().remove(&key).unwrap();
             self.listener_map
                 .write()
                 .unwrap()
@@ -126,7 +124,7 @@ impl VsockThreadBackend {
         }
 
         // Handle other packet types per connection
-        conn.write().unwrap().recv_pkt(pkt)?;
+        conn.recv_pkt(pkt)?;
 
         Ok(())
     }
@@ -171,18 +169,12 @@ impl VsockThreadBackend {
 
         if pkt.op() == VSOCK_OP_RST {
             // Handle an RST packet from the guest here
-            let conn_map = self.conn_map.read().unwrap();
-            let conn = conn_map.get(&key).unwrap();
-            if conn
-                .read()
-                .unwrap()
-                .rx_queue
-                .contains(RxOps::Reset.bitmask())
-            {
+            let conn_mutex = self.conn_map.read().unwrap().get(&key).unwrap().clone();
+            let conn = conn_mutex.lock().unwrap();
+            if conn.rx_queue.contains(RxOps::Reset.bitmask()) {
                 return Ok(());
             }
-            let conn_lock = self.conn_map.write().unwrap().remove(&key).unwrap();
-            let conn = conn_lock.read().unwrap();
+            self.conn_map.write().unwrap().remove(&key).unwrap();
             self.listener_map
                 .write()
                 .unwrap()
@@ -208,11 +200,11 @@ impl VsockThreadBackend {
         }
 
         // Forward this packet to its listening connection
-        let conn_map = self.conn_map.read().unwrap();
-        let conn = conn_map.get(&key).unwrap();
-        conn.write().unwrap().send_pkt(pkt)?;
+        let conn_mutex = self.conn_map.read().unwrap().get(&key).unwrap().clone();
+        let mut conn = conn_mutex.lock().unwrap();
+        conn.send_pkt(pkt)?;
 
-        if conn.read().unwrap().rx_queue.pending_rx() {
+        if conn.rx_queue.pending_rx() {
             // Required if the connection object adds new rx operations
             self.backend_rxq.write().unwrap().push_back(key);
         }
@@ -247,7 +239,7 @@ impl VsockThreadBackend {
             .unwrap()
             .insert(stream_fd, ConnMapKey::new(pkt.dst_port(), pkt.src_port()));
 
-        let conn = RwLock::new(VsockConnection::new_peer_init(
+        let conn = Arc::new(Mutex::new(VsockConnection::new_peer_init(
             stream,
             pkt.dst_cid(),
             pkt.dst_port(),
@@ -255,7 +247,7 @@ impl VsockThreadBackend {
             pkt.src_port(),
             self.epoll_fd,
             pkt.buf_alloc(),
-        ));
+        )));
 
         self.conn_map
             .write()

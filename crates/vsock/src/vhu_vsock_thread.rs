@@ -10,7 +10,7 @@ use std::{
         net::{UnixListener, UnixStream},
         prelude::{AsRawFd, FromRawFd, RawFd},
     },
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex},
 };
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
@@ -286,7 +286,7 @@ impl VhostUserVsockRxThread {
                     .conn_map
                     .write()
                     .unwrap()
-                    .insert(conn_map_key, RwLock::new(new_conn));
+                    .insert(conn_map_key, Arc::new(Mutex::new(new_conn)));
 
                 self.thread_backend
                     .backend_rxq
@@ -303,13 +303,24 @@ impl VhostUserVsockRxThread {
                 .unwrap();
             } else {
                 // Previously connected connection
-                let listener_map = self.thread_backend.listener_map.read().unwrap();
-                let conn_map = self.thread_backend.conn_map.read().unwrap();
-
-                let key = listener_map.get(&fd).unwrap();
-
-                let mut conn_guard = conn_map.get(key).unwrap().write().unwrap();
-                let conn = conn_guard.deref_mut();
+                let key = (*self
+                    .thread_backend
+                    .listener_map
+                    .read()
+                    .unwrap()
+                    .get(&fd)
+                    .unwrap())
+                .clone();
+                let conn_mutex = self
+                    .thread_backend
+                    .conn_map
+                    .read()
+                    .unwrap()
+                    .get(&key)
+                    .unwrap()
+                    .clone();
+                let mut conn_lock = conn_mutex.lock().unwrap();
+                let conn = conn_lock.deref_mut();
 
                 if evset == epoll::Events::EPOLLOUT {
                     // Flush any remaining data from the tx buffer
