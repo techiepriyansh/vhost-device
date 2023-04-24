@@ -110,7 +110,7 @@ pub(crate) trait VhostUserVsockThread: Send {
     ) -> Result<bool>;
 }
 
-pub(crate) struct VhostUserVsockTxThread {
+pub(crate) struct VhostUserVsockRxThread {
     /// Guest memory map.
     pub mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     /// VIRTIO_RING_F_EVENT_IDX.
@@ -135,7 +135,7 @@ pub(crate) struct VhostUserVsockTxThread {
     local_port: Wrapping<u32>,
 }
 
-impl VhostUserVsockTxThread {
+impl VhostUserVsockRxThread {
     /// Create a new instance of VhostUserTxVsockThread.
     pub fn new(uds_path: String, guest_cid: u64) -> Result<Self> {
         // TODO: better error handling, maybe add a param to force the unlink
@@ -150,7 +150,7 @@ impl VhostUserVsockTxThread {
 
         let host_raw_fd = host_sock.as_raw_fd();
 
-        let thread = VhostUserVsockTxThread {
+        let thread = VhostUserVsockRxThread {
             mem: None,
             event_idx: false,
             host_sock: host_sock.as_raw_fd(),
@@ -178,7 +178,7 @@ impl VhostUserVsockTxThread {
     }
 
     /// Process a BACKEND_EVENT received by VhostUserVsockBackend.
-    pub fn process_backend_evt(&mut self, _evset: EventSet) {
+    pub fn process_backend_event(&mut self, _evset: EventSet) {
         let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 32];
         'epoll: loop {
             match epoll::wait(self.epoll_file.as_raw_fd(), 0, epoll_events.as_mut_slice()) {
@@ -409,189 +409,6 @@ impl VhostUserVsockTxThread {
         Ok(())
     }
 
-    /// Process tx queue and send requests to the backend for processing.
-    fn process_tx_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
-        let mut used_any = false;
-
-        let atomic_mem = match &self.mem {
-            Some(m) => m,
-            None => return Err(Error::NoMemoryConfigured),
-        };
-
-        while let Some(mut avail_desc) = vring
-            .get_mut()
-            .get_queue_mut()
-            .iter(atomic_mem.memory())
-            .map_err(|_| Error::IterateQueue)?
-            .next()
-        {
-            used_any = true;
-            let mem = atomic_mem.clone().memory();
-
-            let head_idx = avail_desc.head_index();
-            let pkt = match VsockPacket::from_tx_virtq_chain(
-                mem.deref(),
-                &mut avail_desc,
-                CONN_TX_BUF_SIZE,
-            ) {
-                Ok(pkt) => pkt,
-                Err(e) => {
-                    dbg!("vsock: error reading TX packet: {:?}", e);
-                    continue;
-                }
-            };
-
-            if self.thread_backend.send_pkt(&pkt).is_err() {
-                vring
-                    .get_mut()
-                    .get_queue_mut()
-                    .iter(mem)
-                    .unwrap()
-                    .go_to_previous_position();
-                break;
-            }
-
-            // TODO: Check if the protocol requires read length to be correct
-            let used_len = 0;
-
-            let vring = vring.clone();
-            let event_idx = self.event_idx;
-
-            self.pool.spawn_ok(async move {
-                if event_idx {
-                    if vring.add_used(head_idx, used_len as u32).is_err() {
-                        warn!("Could not return used descriptors to ring");
-                    }
-                    match vring.needs_notification() {
-                        Err(_) => {
-                            warn!("Could not check if queue needs to be notified");
-                            vring.signal_used_queue().unwrap();
-                        }
-                        Ok(needs_notification) => {
-                            if needs_notification {
-                                vring.signal_used_queue().unwrap();
-                            }
-                        }
-                    }
-                } else {
-                    if vring.add_used(head_idx, used_len as u32).is_err() {
-                        warn!("Could not return used descriptors to ring");
-                    }
-                    vring.signal_used_queue().unwrap();
-                }
-            });
-        }
-
-        Ok(used_any)
-    }
-
-    /// Wrapper to process tx queue based on whether event idx is enabled or not.
-    pub fn process_tx(&mut self, vring_lock: &VringRwLock, event_idx: bool) -> Result<bool> {
-        if event_idx {
-            // To properly handle EVENT_IDX we need to keep calling
-            // process_rx_queue until it stops finding new requests
-            // on the queue, as vm-virtio's Queue implementation
-            // only checks avail_index once
-            loop {
-                vring_lock.disable_notification().unwrap();
-                self.process_tx_queue(vring_lock)?;
-                if !vring_lock.enable_notification().unwrap() {
-                    break;
-                }
-            }
-        } else {
-            self.process_tx_queue(vring_lock)?;
-        }
-        Ok(false)
-    }
-}
-
-impl VhostUserVsockThread for VhostUserVsockTxThread {
-    fn set_event_idx(&mut self, enabled: bool) {
-        self.event_idx = enabled;
-    }
-
-    fn update_memory(&mut self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>) {
-        self.mem = Some(atomic_mem);
-    }
-
-    fn set_vring_worker(
-        &mut self,
-        vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
-    ) {
-        self.vring_worker = vring_worker;
-        self.vring_worker
-            .as_ref()
-            .unwrap()
-            .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
-            .unwrap();
-    }
-
-    fn handle_event(
-        &mut self,
-        device_event: u16,
-        evset: EventSet,
-        vrings: &[VringRwLock],
-    ) -> Result<bool> {
-        let vring = &vrings[0];
-
-        if evset != EventSet::IN {
-            return Err(Error::HandleEventNotEpollIn);
-        }
-
-        match device_event {
-            THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT => {
-                self.process_tx(vring, self.event_idx)?;
-            }
-            EVT_QUEUE_EVENT => {}
-            BACKEND_EVENT => {
-                self.process_backend_evt(evset);
-                self.process_tx(vring, self.event_idx)?;
-            }
-            _ => {
-                return Err(Error::HandleUnknownEvent);
-            }
-        }
-
-        Ok(false)
-    }
-}
-
-impl Drop for VhostUserVsockTxThread {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.host_sock_path);
-    }
-}
-
-pub(crate) struct VhostUserVsockRxThread {
-    /// Guest memory map.
-    pub mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
-    /// VIRTIO_RING_F_EVENT_IDX.
-    pub event_idx: bool,
-    /// Instance of VringWorker.
-    vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
-    /// VsockThreadBackend instance.
-    pub thread_backend: Arc<VsockThreadBackend>,
-    /// Thread pool to handle event idx.
-    pool: ThreadPool,
-}
-
-impl VhostUserVsockRxThread {
-    pub fn new(thread_backend: Arc<VsockThreadBackend>) -> Result<Self> {
-        let thread = VhostUserVsockRxThread {
-            mem: None,
-            event_idx: false,
-            vring_worker: None,
-            thread_backend,
-            pool: ThreadPoolBuilder::new()
-                .pool_size(1)
-                .create()
-                .map_err(Error::CreateThreadPool)?,
-        };
-
-        Ok(thread)
-    }
-
     /// Iterate over the rx queue and process rx requests.
     fn process_rx_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
         let mut used_any = false;
@@ -693,6 +510,193 @@ impl VhostUserVsockRxThread {
 }
 
 impl VhostUserVsockThread for VhostUserVsockRxThread {
+    fn set_event_idx(&mut self, enabled: bool) {
+        self.event_idx = enabled;
+    }
+
+    fn update_memory(&mut self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>) {
+        self.mem = Some(atomic_mem);
+    }
+
+    fn set_vring_worker(
+        &mut self,
+        vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
+    ) {
+        self.vring_worker = vring_worker;
+        self.vring_worker
+            .as_ref()
+            .unwrap()
+            .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
+            .unwrap();
+    }
+
+    fn handle_event(
+        &mut self,
+        device_event: u16,
+        evset: EventSet,
+        vrings: &[VringRwLock],
+    ) -> Result<bool> {
+        let vring = &vrings[0];
+
+        if evset != EventSet::IN {
+            return Err(Error::HandleEventNotEpollIn);
+        }
+
+        match device_event {
+            THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT => {
+                if self.thread_backend.pending_rx() {
+                    self.process_rx(vring, self.event_idx)?;
+                }
+            }
+            EVT_QUEUE_EVENT => {}
+            BACKEND_EVENT => {
+                self.process_backend_event(evset);
+                if self.thread_backend.pending_rx() {
+                    self.process_rx(vring, self.event_idx)?;
+                }
+            }
+            _ => {
+                return Err(Error::HandleUnknownEvent);
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+impl Drop for VhostUserVsockRxThread {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.host_sock_path);
+    }
+}
+
+pub(crate) struct VhostUserVsockTxThread {
+    /// Guest memory map.
+    pub mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    /// VIRTIO_RING_F_EVENT_IDX.
+    pub event_idx: bool,
+    /// Instance of VringWorker.
+    vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
+    /// VsockThreadBackend instance.
+    pub thread_backend: Arc<VsockThreadBackend>,
+    /// Thread pool to handle event idx.
+    pool: ThreadPool,
+}
+
+impl VhostUserVsockTxThread {
+    pub fn new(thread_backend: Arc<VsockThreadBackend>) -> Result<Self> {
+        let thread = VhostUserVsockTxThread {
+            mem: None,
+            event_idx: false,
+            vring_worker: None,
+            thread_backend,
+            pool: ThreadPoolBuilder::new()
+                .pool_size(1)
+                .create()
+                .map_err(Error::CreateThreadPool)?,
+        };
+
+        Ok(thread)
+    }
+
+    /// Process tx queue and send requests to the backend for processing.
+    fn process_tx_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
+        let mut used_any = false;
+
+        let atomic_mem = match &self.mem {
+            Some(m) => m,
+            None => return Err(Error::NoMemoryConfigured),
+        };
+
+        while let Some(mut avail_desc) = vring
+            .get_mut()
+            .get_queue_mut()
+            .iter(atomic_mem.memory())
+            .map_err(|_| Error::IterateQueue)?
+            .next()
+        {
+            used_any = true;
+            let mem = atomic_mem.clone().memory();
+
+            let head_idx = avail_desc.head_index();
+            let pkt = match VsockPacket::from_tx_virtq_chain(
+                mem.deref(),
+                &mut avail_desc,
+                CONN_TX_BUF_SIZE,
+            ) {
+                Ok(pkt) => pkt,
+                Err(e) => {
+                    dbg!("vsock: error reading TX packet: {:?}", e);
+                    continue;
+                }
+            };
+
+            if self.thread_backend.send_pkt(&pkt).is_err() {
+                vring
+                    .get_mut()
+                    .get_queue_mut()
+                    .iter(mem)
+                    .unwrap()
+                    .go_to_previous_position();
+                break;
+            }
+
+            // TODO: Check if the protocol requires read length to be correct
+            let used_len = 0;
+
+            let vring = vring.clone();
+            let event_idx = self.event_idx;
+
+            self.pool.spawn_ok(async move {
+                if event_idx {
+                    if vring.add_used(head_idx, used_len as u32).is_err() {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    match vring.needs_notification() {
+                        Err(_) => {
+                            warn!("Could not check if queue needs to be notified");
+                            vring.signal_used_queue().unwrap();
+                        }
+                        Ok(needs_notification) => {
+                            if needs_notification {
+                                vring.signal_used_queue().unwrap();
+                            }
+                        }
+                    }
+                } else {
+                    if vring.add_used(head_idx, used_len as u32).is_err() {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    vring.signal_used_queue().unwrap();
+                }
+            });
+        }
+
+        Ok(used_any)
+    }
+
+    /// Wrapper to process tx queue based on whether event idx is enabled or not.
+    pub fn process_tx(&mut self, vring_lock: &VringRwLock, event_idx: bool) -> Result<bool> {
+        if event_idx {
+            // To properly handle EVENT_IDX we need to keep calling
+            // process_rx_queue until it stops finding new requests
+            // on the queue, as vm-virtio's Queue implementation
+            // only checks avail_index once
+            loop {
+                vring_lock.disable_notification().unwrap();
+                self.process_tx_queue(vring_lock)?;
+                if !vring_lock.enable_notification().unwrap() {
+                    break;
+                }
+            }
+        } else {
+            self.process_tx_queue(vring_lock)?;
+        }
+        Ok(false)
+    }
+}
+
+impl VhostUserVsockThread for VhostUserVsockTxThread {
      fn set_event_idx(&mut self, enabled: bool) {
         self.event_idx = enabled;
     }
@@ -722,9 +726,7 @@ impl VhostUserVsockThread for VhostUserVsockRxThread {
 
         match device_event {
             THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT => {
-                if self.thread_backend.pending_rx() {
-                    self.process_rx(vring, self.event_idx)?;
-                }
+                self.process_tx(vring, self.event_idx)?;
             }
             EVT_QUEUE_EVENT => {}
             _ => {
