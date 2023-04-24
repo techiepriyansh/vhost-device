@@ -34,15 +34,17 @@ pub(crate) struct VsockThreadBackend {
     pub stream_map: RwLock<HashMap<i32, UnixStream>>,
     /// Host side socket for listening to new connections from the host.
     host_socket_path: String,
-    /// epoll for registering new host-side connections.
-    epoll_fd: i32,
+    /// epoll for registering new host-side connections' EPOLLIN events.
+    epoll_in_fd: i32,
+    /// epoll for registering new host-side connections' EPOLLOUT events.
+    epoll_out_fd: i32,
     /// Set of allocated local ports.
     pub local_port_set: RwLock<HashSet<u32>>,
 }
 
 impl VsockThreadBackend {
     /// New instance of VsockThreadBackend.
-    pub fn new(host_socket_path: String, epoll_fd: i32) -> Self {
+    pub fn new(host_socket_path: String, epoll_in_fd: i32, epoll_out_fd: i32) -> Self {
         Self {
             listener_map: RwLock::new(HashMap::new()),
             conn_map: RwLock::new(HashMap::new()),
@@ -51,7 +53,8 @@ impl VsockThreadBackend {
             // TODO: think of a better solution
             stream_map: RwLock::new(HashMap::new()),
             host_socket_path,
-            epoll_fd,
+            epoll_in_fd,
+            epoll_out_fd,
             local_port_set: RwLock::new(HashSet::new()),
         }
     }
@@ -86,7 +89,15 @@ impl VsockThreadBackend {
             self.listener_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.stream_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.local_port_set.write().unwrap().remove(&conn.local_port);
-            EpollHelpers::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
+            EpollHelpers::epoll_unregister(conn.epoll_in_fd, conn.stream.as_raw_fd())
+                .unwrap_or_else(|err| {
+                    warn!(
+                        "Could not remove epoll listener for fd {:?}: {:?}",
+                        conn.stream.as_raw_fd(),
+                        err
+                    )
+                });
+            EpollHelpers::epoll_unregister(conn.epoll_out_fd, conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
@@ -166,7 +177,15 @@ impl VsockThreadBackend {
             self.listener_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.stream_map.write().unwrap().remove(&conn.stream.as_raw_fd());
             self.local_port_set.write().unwrap().remove(&conn.local_port);
-            EpollHelpers::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
+            EpollHelpers::epoll_unregister(conn.epoll_in_fd, conn.stream.as_raw_fd())
+                .unwrap_or_else(|err| {
+                    warn!(
+                        "Could not remove epoll listener for fd {:?}: {:?}",
+                        conn.stream.as_raw_fd(),
+                        err
+                    )
+                });
+            EpollHelpers::epoll_unregister(conn.epoll_out_fd, conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
@@ -221,7 +240,8 @@ impl VsockThreadBackend {
             pkt.dst_port(),
             pkt.src_cid(),
             pkt.src_port(),
-            self.epoll_fd,
+            self.epoll_in_fd,
+            self.epoll_out_fd,
             pkt.buf_alloc(),
         ));
 
@@ -238,9 +258,14 @@ impl VsockThreadBackend {
         self.local_port_set.write().unwrap().insert(pkt.dst_port());
 
         EpollHelpers::epoll_register(
-            self.epoll_fd,
+            self.epoll_in_fd,
             stream_fd,
-            epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+            epoll::Events::EPOLLIN,
+        )?;
+        EpollHelpers::epoll_register(
+            self.epoll_out_fd,
+            stream_fd,
+            epoll::Events::EPOLLOUT,
         )?;
         Ok(())
     }
