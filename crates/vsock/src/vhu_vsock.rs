@@ -200,15 +200,21 @@ pub(crate) struct VhostUserVsockBackend {
 
 impl VhostUserVsockBackend {
     pub fn new(config: VsockConfig) -> Result<Self> {
+        let rx_event_fd = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
         let tx_event_fd = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
 
         let rx_thread = VhostUserVsockRxThread::new(
             config.get_uds_path(),
             config.get_guest_cid(),
+            rx_event_fd.try_clone().unwrap(),
             tx_event_fd.try_clone().unwrap(),
         )?;
 
-        let tx_thread = VhostUserVsockTxThread::new(rx_thread.thread_backend.clone(), tx_event_fd)?;
+        let tx_thread = VhostUserVsockTxThread::new(
+            rx_thread.thread_backend.clone(),
+            rx_event_fd,
+            tx_event_fd,
+        )?;
 
         let queues_per_thread = vec![TX_QUEUE_MASK, RX_QUEUE_MASK];
 
