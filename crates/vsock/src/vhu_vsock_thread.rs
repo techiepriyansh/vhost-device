@@ -19,7 +19,7 @@ use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
 use virtio_queue::QueueOwnedT;
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::{GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
-use vmm_sys_util::epoll::EventSet;
+use vmm_sys_util::{epoll::EventSet, eventfd::EventFd};
 
 use crate::{
     rxops::*,
@@ -46,6 +46,9 @@ const THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT: u16 = 0;
 
 /// Notification coming from the backend.
 pub(crate) const BACKEND_EVENT: u16 = 3;
+
+/// Notification to process Tx coming from the Rx thread in the Tx thread.
+pub(crate) const CUSTOM_TX_EVENT: u16 = 4;
 
 pub(crate) struct EpollHelpers;
 
@@ -132,11 +135,13 @@ pub(crate) struct VhostUserVsockRxThread {
     pool: ThreadPool,
     /// host side port on which application listens.
     local_port: Wrapping<u32>,
+    /// EventFd to signal the Tx thread to process Tx.
+    tx_event_fd: EventFd,
 }
 
 impl VhostUserVsockRxThread {
     /// Create a new instance of VhostUserTxVsockThread.
-    pub fn new(uds_path: String, guest_cid: u64) -> Result<Self> {
+    pub fn new(uds_path: String, guest_cid: u64, tx_event_fd: EventFd) -> Result<Self> {
         // TODO: better error handling, maybe add a param to force the unlink
         let _ = std::fs::remove_file(uds_path.clone());
         let host_sock = UnixListener::bind(&uds_path)
@@ -164,6 +169,7 @@ impl VhostUserVsockRxThread {
                 .create()
                 .map_err(Error::CreateThreadPool)?,
             local_port: Wrapping(0),
+            tx_event_fd,
         };
 
         EpollHelpers::epoll_register(epoll_fd, host_raw_fd, epoll::Events::EPOLLIN)?;
@@ -577,6 +583,7 @@ impl VhostUserVsockThread for VhostUserVsockRxThread {
                 if self.thread_backend.pending_rx() {
                     self.process_rx(vring, self.event_idx)?;
                 }
+                let _ = self.tx_event_fd.write(1);
             }
             _ => {
                 return Err(Error::HandleUnknownEvent);
@@ -604,10 +611,12 @@ pub(crate) struct VhostUserVsockTxThread {
     pub thread_backend: Arc<VsockThreadBackend>,
     /// Thread pool to handle event idx.
     pool: ThreadPool,
+    /// EventFd to signal the thread to process Tx.
+    tx_event_fd: EventFd,
 }
 
 impl VhostUserVsockTxThread {
-    pub fn new(thread_backend: Arc<VsockThreadBackend>) -> Result<Self> {
+    pub fn new(thread_backend: Arc<VsockThreadBackend>, tx_event_fd: EventFd) -> Result<Self> {
         let thread = VhostUserVsockTxThread {
             mem: None,
             event_idx: false,
@@ -617,6 +626,7 @@ impl VhostUserVsockTxThread {
                 .pool_size(1)
                 .create()
                 .map_err(Error::CreateThreadPool)?,
+            tx_event_fd,
         };
 
         Ok(thread)
@@ -733,6 +743,15 @@ impl VhostUserVsockThread for VhostUserVsockTxThread {
         vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
     ) {
         self.vring_worker = vring_worker;
+        self.vring_worker
+            .as_ref()
+            .unwrap()
+            .register_listener(
+                self.tx_event_fd.as_raw_fd(),
+                EventSet::IN,
+                u64::from(CUSTOM_TX_EVENT),
+            )
+            .unwrap();
     }
 
     fn handle_event(
@@ -749,6 +768,9 @@ impl VhostUserVsockThread for VhostUserVsockTxThread {
 
         match device_event {
             THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT => {
+                self.process_tx(vring, self.event_idx)?;
+            }
+            CUSTOM_TX_EVENT => {
                 self.process_tx(vring, self.event_idx)?;
             }
             EVT_QUEUE_EVENT => {}
