@@ -2,7 +2,8 @@
 
 use std::{
     io::{self, Result as IoResult},
-    sync::Mutex,
+    sync::{Arc, Mutex},
+    os::unix::net::UnixListener,
     u16, u32, u64, u8,
 };
 
@@ -19,7 +20,8 @@ use vmm_sys_util::{
     eventfd::{EventFd, EFD_NONBLOCK},
 };
 
-use crate::vhu_vsock_thread::*;
+use crate::{vhu_vsock_thread::*, thread_backend::*};
+
 
 const NUM_QUEUES: usize = 2;
 const QUEUE_SIZE: usize = 256;
@@ -196,17 +198,31 @@ pub(crate) struct VhostUserVsockBackend {
     pub threads: Vec<Mutex<Box<dyn VhostUserVsockThread>>>,
     queues_per_thread: Vec<u64>,
     pub exit_event: EventFd,
+    uds_path: String,
 }
 
 impl VhostUserVsockBackend {
     pub fn new(config: VsockConfig) -> Result<Self> {
-        let tx_thread = VhostUserVsockTxThread::new(
-            config.get_uds_path(),
-            config.get_guest_cid(),
-        )?;
+        let epoll_in_fd = epoll::create(true).map_err(Error::EpollFdCreate)?;
+        let epoll_out_fd = epoll::create(true).map_err(Error::EpollFdCreate)?;
 
+        let thread_backend = Arc::new(VsockThreadBackend::new(config.get_uds_path(), epoll_in_fd, epoll_out_fd));
+
+        let uds_path = config.get_uds_path();
+
+        // TODO: better error handling, maybe add a param to force the unlink
+        let _ = std::fs::remove_file(uds_path.clone());
+        let host_sock = UnixListener::bind(&uds_path)
+            .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
+            .map_err(Error::UnixBind)?;
+
+        let tx_thread = VhostUserVsockTxThread::new(epoll_out_fd, thread_backend.clone())?; 
         let rx_thread = VhostUserVsockRxThread::new(
-            tx_thread.thread_backend.clone(),
+            epoll_in_fd,
+            epoll_out_fd,
+            config.get_guest_cid(),
+            host_sock,
+            thread_backend,
         )?;
 
         let queues_per_thread = vec![TX_QUEUE_MASK, RX_QUEUE_MASK];
@@ -218,6 +234,7 @@ impl VhostUserVsockBackend {
             threads: vec![Mutex::new(Box::new(tx_thread)), Mutex::new(Box::new(rx_thread))],
             queues_per_thread,
             exit_event: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?,
+            uds_path,
         })
     }
 }
@@ -284,6 +301,12 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
 
     fn exit_event(&self, _thread_index: usize) -> Option<EventFd> {
         self.exit_event.try_clone().ok()
+    }
+}
+
+impl Drop for VhostUserVsockBackend {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.uds_path);
     }
 }
 
