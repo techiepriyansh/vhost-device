@@ -200,14 +200,9 @@ pub(crate) struct VhostUserVsockBackend {
 
 impl VhostUserVsockBackend {
     pub fn new(config: VsockConfig) -> Result<Self> {
-        let rx_thread = VhostUserVsockRxThread::new(
-            config.get_uds_path(),
-            config.get_guest_cid(),
-        )?;
+        let rx_thread = VhostUserVsockRxThread::new(config.get_uds_path(), config.get_guest_cid())?;
 
-        let tx_thread = VhostUserVsockTxThread::new(
-            rx_thread.thread_backend.clone(),
-        )?;
+        let tx_thread = VhostUserVsockTxThread::new(rx_thread.thread_backend.clone())?;
 
         let queues_per_thread = vec![TX_QUEUE_MASK, RX_QUEUE_MASK];
 
@@ -215,7 +210,10 @@ impl VhostUserVsockBackend {
             config: VirtioVsockConfig {
                 guest_cid: From::from(config.get_guest_cid()),
             },
-            threads: vec![Mutex::new(Box::new(tx_thread)), Mutex::new(Box::new(rx_thread))],
+            threads: vec![
+                Mutex::new(Box::new(tx_thread)),
+                Mutex::new(Box::new(rx_thread)),
+            ],
             queues_per_thread,
             exit_event: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?,
         })
@@ -262,7 +260,11 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
         vrings: &[VringRwLock],
         thread_id: usize,
     ) -> IoResult<bool> {
-        self.threads[thread_id].lock().unwrap().handle_event(device_event, evset, vrings).map_err(io::Error::from)
+        self.threads[thread_id]
+            .lock()
+            .unwrap()
+            .handle_event(device_event, evset, vrings)
+            .map_err(io::Error::from)
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {

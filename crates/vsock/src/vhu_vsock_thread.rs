@@ -25,8 +25,7 @@ use crate::{
     rxops::*,
     thread_backend::*,
     vhu_vsock::{
-        ConnMapKey, Error, Result, VhostUserVsockBackend, CONN_TX_BUF_SIZE,
-        VSOCK_HOST_CID,
+        ConnMapKey, Error, Result, VhostUserVsockBackend, CONN_TX_BUF_SIZE, VSOCK_HOST_CID,
     },
     vsock_conn::*,
 };
@@ -222,20 +221,26 @@ impl VhostUserVsockRxThread {
         } else {
             // Check if the stream represented by fd has already established a
             // connection with the application running in the guest
-            if !self.thread_backend.listener_map.read().unwrap().contains_key(&fd)
+            if !self
+                .thread_backend
+                .listener_map
+                .read()
+                .unwrap()
+                .contains_key(&fd)
             {
                 // New connection from the host
                 if evset != epoll::Events::EPOLLIN {
                     // Has to be EPOLLIN as it was not connected previously
                     return;
                 }
-                let mut unix_stream = match self.thread_backend.stream_map.write().unwrap().remove(&fd) {
-                    Some(uds) => uds,
-                    None => {
-                        warn!("Error while searching fd in the stream map");
-                        return;
-                    }
-                };
+                let mut unix_stream =
+                    match self.thread_backend.stream_map.write().unwrap().remove(&fd) {
+                        Some(uds) => uds,
+                        None => {
+                            warn!("Error while searching fd in the stream map");
+                            return;
+                        }
+                    };
 
                 // Local peer is sending a "connect PORT\n" command
                 let peer_port = match Self::read_local_stream_port(&mut unix_stream) {
@@ -257,7 +262,9 @@ impl VhostUserVsockRxThread {
 
                 // Insert the fd into the backend's maps
                 self.thread_backend
-                    .listener_map.write().unwrap()
+                    .listener_map
+                    .write()
+                    .unwrap()
                     .insert(fd, ConnMapKey::new(local_port, peer_port));
 
                 // Create a new connection object an enqueue a connection request
@@ -275,10 +282,16 @@ impl VhostUserVsockRxThread {
                 new_conn.set_peer_port(peer_port);
 
                 // Add connection object into the backend's maps
-                self.thread_backend.conn_map.write().unwrap().insert(conn_map_key, RwLock::new(new_conn));
+                self.thread_backend
+                    .conn_map
+                    .write()
+                    .unwrap()
+                    .insert(conn_map_key, RwLock::new(new_conn));
 
                 self.thread_backend
-                    .backend_rxq.write().unwrap()
+                    .backend_rxq
+                    .write()
+                    .unwrap()
                     .push_back(ConnMapKey::new(local_port, peer_port));
 
                 // Re-register the fd to listen for EPOLLIN and EPOLLOUT events
@@ -307,7 +320,9 @@ impl VhostUserVsockRxThread {
                                 conn.rx_queue.enqueue(RxOps::CreditUpdate);
                             }
                             self.thread_backend
-                                .backend_rxq.write().unwrap()
+                                .backend_rxq
+                                .write()
+                                .unwrap()
                                 .push_back(ConnMapKey::new(conn.local_port, conn.peer_port));
                         }
                         Err(e) => {
@@ -324,7 +339,9 @@ impl VhostUserVsockRxThread {
                 // Enqueue a read request
                 conn.rx_queue.enqueue(RxOps::Rw);
                 self.thread_backend
-                    .backend_rxq.write().unwrap()
+                    .backend_rxq
+                    .write()
+                    .unwrap()
                     .push_back(ConnMapKey::new(conn.local_port, conn.peer_port));
             }
         }
@@ -339,12 +356,18 @@ impl VhostUserVsockRxThread {
         loop {
             if !self
                 .thread_backend
-                .local_port_set.read().unwrap()
+                .local_port_set
+                .read()
+                .unwrap()
                 .contains(&alloc_local_port)
             {
                 // The port set doesn't contain the newly allocated port number.
                 self.local_port = Wrapping(alloc_local_port + 1);
-                self.thread_backend.local_port_set.write().unwrap().insert(alloc_local_port);
+                self.thread_backend
+                    .local_port_set
+                    .write()
+                    .unwrap()
+                    .insert(alloc_local_port);
                 return Ok(alloc_local_port);
             } else {
                 if alloc_local_port == self.local_port.0 {
@@ -399,12 +422,12 @@ impl VhostUserVsockRxThread {
     /// Add a stream to epoll to listen for EPOLLIN events.
     fn add_stream_listener(&mut self, stream: UnixStream) -> Result<()> {
         let stream_fd = stream.as_raw_fd();
-        self.thread_backend.stream_map.write().unwrap().insert(stream_fd, stream);
-        EpollHelpers::epoll_register(
-            self.get_epoll_fd(),
-            stream_fd,
-            epoll::Events::EPOLLIN,
-        )?;
+        self.thread_backend
+            .stream_map
+            .write()
+            .unwrap()
+            .insert(stream_fd, stream);
+        EpollHelpers::epoll_register(self.get_epoll_fd(), stream_fd, epoll::Events::EPOLLIN)?;
 
         Ok(())
     }
@@ -697,7 +720,7 @@ impl VhostUserVsockTxThread {
 }
 
 impl VhostUserVsockThread for VhostUserVsockTxThread {
-     fn set_event_idx(&mut self, enabled: bool) {
+    fn set_event_idx(&mut self, enabled: bool) {
         self.event_idx = enabled;
     }
 

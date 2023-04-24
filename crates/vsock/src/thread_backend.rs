@@ -68,7 +68,12 @@ impl VsockThreadBackend {
     /// - `Err(Error::EmptyBackendRxQ) if there was no available data
     pub fn recv_pkt<B: BitmapSlice>(&self, pkt: &mut VsockPacket<B>) -> Result<()> {
         // Pop an event from the backend_rxq
-        let key = self.backend_rxq.write().unwrap().pop_front().ok_or(Error::EmptyBackendRxQ)?;
+        let key = self
+            .backend_rxq
+            .write()
+            .unwrap()
+            .pop_front()
+            .ok_or(Error::EmptyBackendRxQ)?;
         let conn_map = self.conn_map.read().unwrap();
         let conn = match conn_map.get(&key) {
             Some(conn) => conn,
@@ -83,17 +88,27 @@ impl VsockThreadBackend {
             let conn_lock = self.conn_map.write().unwrap().remove(&key).unwrap();
             let conn = conn_lock.read().unwrap();
 
-            self.listener_map.write().unwrap().remove(&conn.stream.as_raw_fd());
-            self.stream_map.write().unwrap().remove(&conn.stream.as_raw_fd());
-            self.local_port_set.write().unwrap().remove(&conn.local_port);
-            EpollHelpers::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
-                .unwrap_or_else(|err| {
+            self.listener_map
+                .write()
+                .unwrap()
+                .remove(&conn.stream.as_raw_fd());
+            self.stream_map
+                .write()
+                .unwrap()
+                .remove(&conn.stream.as_raw_fd());
+            self.local_port_set
+                .write()
+                .unwrap()
+                .remove(&conn.local_port);
+            EpollHelpers::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd()).unwrap_or_else(
+                |err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
                         conn.stream.as_raw_fd(),
                         err
                     )
-                });
+                },
+            );
 
             // Initialize the packet header to contain a VSOCK_OP_RST operation
             pkt.set_op(VSOCK_OP_RST)
@@ -158,22 +173,37 @@ impl VsockThreadBackend {
             // Handle an RST packet from the guest here
             let conn_map = self.conn_map.read().unwrap();
             let conn = conn_map.get(&key).unwrap();
-            if conn.read().unwrap().rx_queue.contains(RxOps::Reset.bitmask()) {
+            if conn
+                .read()
+                .unwrap()
+                .rx_queue
+                .contains(RxOps::Reset.bitmask())
+            {
                 return Ok(());
             }
             let conn_lock = self.conn_map.write().unwrap().remove(&key).unwrap();
             let conn = conn_lock.read().unwrap();
-            self.listener_map.write().unwrap().remove(&conn.stream.as_raw_fd());
-            self.stream_map.write().unwrap().remove(&conn.stream.as_raw_fd());
-            self.local_port_set.write().unwrap().remove(&conn.local_port);
-            EpollHelpers::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
-                .unwrap_or_else(|err| {
+            self.listener_map
+                .write()
+                .unwrap()
+                .remove(&conn.stream.as_raw_fd());
+            self.stream_map
+                .write()
+                .unwrap()
+                .remove(&conn.stream.as_raw_fd());
+            self.local_port_set
+                .write()
+                .unwrap()
+                .remove(&conn.local_port);
+            EpollHelpers::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd()).unwrap_or_else(
+                |err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
                         conn.stream.as_raw_fd(),
                         err
                     )
-                });
+                },
+            );
             return Ok(());
         }
 
@@ -212,7 +242,9 @@ impl VsockThreadBackend {
         pkt: &VsockPacket<B>,
     ) -> Result<()> {
         let stream_fd = stream.as_raw_fd();
-        self.listener_map.write().unwrap()
+        self.listener_map
+            .write()
+            .unwrap()
             .insert(stream_fd, ConnMapKey::new(pkt.dst_port(), pkt.src_port()));
 
         let conn = RwLock::new(VsockConnection::new_peer_init(
@@ -225,9 +257,13 @@ impl VsockThreadBackend {
             pkt.buf_alloc(),
         ));
 
-        self.conn_map.write().unwrap()
+        self.conn_map
+            .write()
+            .unwrap()
             .insert(ConnMapKey::new(pkt.dst_port(), pkt.src_port()), conn);
-        self.backend_rxq.write().unwrap()
+        self.backend_rxq
+            .write()
+            .unwrap()
             .push_back(ConnMapKey::new(pkt.dst_port(), pkt.src_port()));
 
         self.stream_map.write().unwrap().insert(
