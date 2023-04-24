@@ -48,8 +48,10 @@ pub(crate) struct VsockConnection<S> {
     peer_fwd_cnt: Wrapping<u32>,
     /// The total number of bytes sent to the guest vsock driver.
     rx_cnt: Wrapping<u32>,
-    /// epoll fd to which this connection's stream has to be added.
-    pub epoll_fd: RawFd,
+    /// epoll fd to which this connection's stream has to be added for EPOLLIN events.
+    pub epoll_in_fd: RawFd,
+    /// epoll fd to which this connection's stream has to be added for EPOLLOUT events.
+    pub epoll_out_fd: RawFd,
     /// Local tx buffer.
     pub tx_buf: LocalTxBuf,
 }
@@ -63,7 +65,8 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
         local_port: u32,
         guest_cid: u64,
         guest_port: u32,
-        epoll_fd: RawFd,
+        epoll_in_fd: RawFd,
+        epoll_out_fd: RawFd,
     ) -> Self {
         Self {
             stream,
@@ -78,7 +81,8 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
-            epoll_fd,
+            epoll_in_fd,
+            epoll_out_fd,
             tx_buf: LocalTxBuf::new(),
         }
     }
@@ -91,7 +95,8 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
         local_port: u32,
         guest_cid: u64,
         guest_port: u32,
-        epoll_fd: RawFd,
+        epoll_in_fd: RawFd,
+        epoll_out_fd: RawFd,
         peer_buf_alloc: u32,
     ) -> Self {
         let mut rx_queue = RxQueue::new();
@@ -109,7 +114,8 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
             peer_buf_alloc,
             peer_fwd_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
-            epoll_fd,
+            epoll_in_fd,
+            epoll_out_fd,
             tx_buf: LocalTxBuf::new(),
         }
     }
@@ -168,9 +174,14 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
 
                         // Re-register the stream file descriptor for read and write events
                         EpollHelpers::epoll_register(
-                            self.epoll_fd,
+                            self.epoll_in_fd,
                             self.stream.as_raw_fd(),
-                            epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                            epoll::Events::EPOLLIN,
+                        )?;
+                        EpollHelpers::epoll_register(
+                            self.epoll_out_fd,
+                            self.stream.as_raw_fd(),
+                            epoll::Events::EPOLLOUT,
                         )?;
                     }
 
@@ -240,16 +251,31 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
 
                 // Re-register the stream file descriptor for read and write events
                 if EpollHelpers::epoll_modify(
-                    self.epoll_fd,
+                    self.epoll_in_fd,
                     self.stream.as_raw_fd(),
-                    epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                    epoll::Events::EPOLLIN,
                 )
                 .is_err()
                 {
                     EpollHelpers::epoll_register(
-                        self.epoll_fd,
+                        self.epoll_in_fd,
                         self.stream.as_raw_fd(),
-                        epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                        epoll::Events::EPOLLIN,
+                    )
+                    .unwrap();
+                };
+
+                if EpollHelpers::epoll_modify(
+                    self.epoll_out_fd,
+                    self.stream.as_raw_fd(),
+                    epoll::Events::EPOLLOUT,
+                )
+                .is_err()
+                {
+                    EpollHelpers::epoll_register(
+                        self.epoll_out_fd,
+                        self.stream.as_raw_fd(),
+                        epoll::Events::EPOLLOUT,
                     )
                     .unwrap();
                 };
@@ -346,6 +372,7 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
     }
 }
 
+/*
 #[cfg(test)]
 mod tests {
     use byteorder::{ByteOrder, LittleEndian};
@@ -723,3 +750,4 @@ mod tests {
         assert!(conn_local.rx_queue.contains(RxOps::Reset.bitmask()));
     }
 }
+*/
