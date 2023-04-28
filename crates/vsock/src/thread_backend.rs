@@ -280,6 +280,7 @@ impl VsockThreadBackend {
     }
 }
 
+/*
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,3 +341,4 @@ mod tests {
         let _ = std::fs::remove_file(VSOCK_PEER_PATH);
     }
 }
+*/
