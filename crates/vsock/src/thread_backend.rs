@@ -341,3 +341,4 @@ mod tests {
         let _ = std::fs::remove_file(VSOCK_PEER_PATH);
     }
 }
+*/

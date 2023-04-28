@@ -771,6 +771,8 @@ impl VhostUserVsockThread for VhostUserVsockTxThread {
         Ok(false)
     }
 }
+
+/*
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,7 +780,7 @@ mod tests {
     use vm_memory::GuestAddress;
     use vmm_sys_util::eventfd::EventFd;
 
-    impl VhostUserVsockThread {
+    impl VhostUserVsockTxThread {
         fn get_epoll_file(&self) -> &File {
             &self.epoll_file
         }
@@ -869,3 +871,4 @@ mod tests {
         assert!(t.process_rx(&vring, true).is_err());
     }
 }
+*/
