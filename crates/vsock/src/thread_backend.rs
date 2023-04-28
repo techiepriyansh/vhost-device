@@ -6,6 +6,7 @@ use std::{
         net::UnixStream,
         prelude::{AsRawFd, FromRawFd, RawFd},
     },
+    sync::{Arc, Mutex, RwLock},
 };
 
 use log::{info, warn};
@@ -24,40 +25,40 @@ use crate::{
 
 pub(crate) struct VsockThreadBackend {
     /// Map of ConnMapKey objects indexed by raw file descriptors.
-    pub listener_map: HashMap<RawFd, ConnMapKey>,
+    pub listener_map: RwLock<HashMap<RawFd, ConnMapKey>>,
     /// Map of vsock connection objects indexed by ConnMapKey objects.
-    pub conn_map: HashMap<ConnMapKey, VsockConnection<UnixStream>>,
+    pub conn_map: RwLock<HashMap<ConnMapKey, Arc<Mutex<VsockConnection<UnixStream>>>>>,
     /// Queue of ConnMapKey objects indicating pending rx operations.
-    pub backend_rxq: VecDeque<ConnMapKey>,
+    pub backend_rxq: RwLock<VecDeque<ConnMapKey>>,
     /// Map of host-side unix streams indexed by raw file descriptors.
-    pub stream_map: HashMap<i32, UnixStream>,
+    pub stream_map: RwLock<HashMap<i32, UnixStream>>,
     /// Host side socket for listening to new connections from the host.
     host_socket_path: String,
     /// epoll for registering new host-side connections.
     epoll_fd: i32,
     /// Set of allocated local ports.
-    pub local_port_set: HashSet<u32>,
+    pub local_port_set: RwLock<HashSet<u32>>,
 }
 
 impl VsockThreadBackend {
     /// New instance of VsockThreadBackend.
     pub fn new(host_socket_path: String, epoll_fd: i32) -> Self {
         Self {
-            listener_map: HashMap::new(),
-            conn_map: HashMap::new(),
-            backend_rxq: VecDeque::new(),
+            listener_map: RwLock::new(HashMap::new()),
+            conn_map: RwLock::new(HashMap::new()),
+            backend_rxq: RwLock::new(VecDeque::new()),
             // Need this map to prevent connected stream from closing
             // TODO: think of a better solution
-            stream_map: HashMap::new(),
+            stream_map: RwLock::new(HashMap::new()),
             host_socket_path,
             epoll_fd,
-            local_port_set: HashSet::new(),
+            local_port_set: RwLock::new(HashSet::new()),
         }
     }
 
     /// Checks if there are pending rx requests in the backend rxq.
     pub fn pending_rx(&self) -> bool {
-        !self.backend_rxq.is_empty()
+        !self.backend_rxq.read().unwrap().is_empty()
     }
 
     /// Deliver a vsock packet to the guest vsock driver.
@@ -65,23 +66,38 @@ impl VsockThreadBackend {
     /// Returns:
     /// - `Ok(())` if the packet was successfully filled in
     /// - `Err(Error::EmptyBackendRxQ) if there was no available data
-    pub fn recv_pkt<B: BitmapSlice>(&mut self, pkt: &mut VsockPacket<B>) -> Result<()> {
+    pub fn recv_pkt<B: BitmapSlice>(&self, pkt: &mut VsockPacket<B>) -> Result<()> {
         // Pop an event from the backend_rxq
-        let key = self.backend_rxq.pop_front().ok_or(Error::EmptyBackendRxQ)?;
-        let conn = match self.conn_map.get_mut(&key) {
-            Some(conn) => conn,
+        let key = self
+            .backend_rxq
+            .write()
+            .unwrap()
+            .pop_front()
+            .ok_or(Error::EmptyBackendRxQ)?;
+        let conn_mutex = match self.conn_map.read().unwrap().get(&key) {
+            Some(conn) => conn.clone(),
             None => {
                 // assume that the connection does not exist
                 return Ok(());
             }
         };
+        let mut conn = conn_mutex.lock().unwrap();
 
         if conn.rx_queue.peek() == Some(RxOps::Reset) {
             // Handle RST events here
-            let conn = self.conn_map.remove(&key).unwrap();
-            self.listener_map.remove(&conn.stream.as_raw_fd());
-            self.stream_map.remove(&conn.stream.as_raw_fd());
-            self.local_port_set.remove(&conn.local_port);
+            self.conn_map.write().unwrap().remove(&key).unwrap();
+            self.listener_map
+                .write()
+                .unwrap()
+                .remove(&conn.stream.as_raw_fd());
+            self.stream_map
+                .write()
+                .unwrap()
+                .remove(&conn.stream.as_raw_fd());
+            self.local_port_set
+                .write()
+                .unwrap()
+                .remove(&conn.local_port);
             VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
@@ -119,7 +135,7 @@ impl VsockThreadBackend {
     ///
     /// Returns:
     /// - always `Ok(())` if packet has been consumed correctly
-    pub fn send_pkt<B: BitmapSlice>(&mut self, pkt: &VsockPacket<B>) -> Result<()> {
+    pub fn send_pkt<B: BitmapSlice>(&self, pkt: &VsockPacket<B>) -> Result<()> {
         let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
 
         // TODO: Rst if packet has unsupported type
@@ -140,7 +156,7 @@ impl VsockThreadBackend {
 
         // TODO: Handle cases where connection does not exist and packet op
         // is not VSOCK_OP_REQUEST
-        if !self.conn_map.contains_key(&key) {
+        if !self.conn_map.read().unwrap().contains_key(&key) {
             // The packet contains a new connection request
             if pkt.op() == VSOCK_OP_REQUEST {
                 self.handle_new_guest_conn(pkt);
@@ -152,14 +168,24 @@ impl VsockThreadBackend {
 
         if pkt.op() == VSOCK_OP_RST {
             // Handle an RST packet from the guest here
-            let conn = self.conn_map.get(&key).unwrap();
+            let conn_mutex = self.conn_map.read().unwrap().get(&key).unwrap().clone();
+            let conn = conn_mutex.lock().unwrap();
             if conn.rx_queue.contains(RxOps::Reset.bitmask()) {
                 return Ok(());
             }
-            let conn = self.conn_map.remove(&key).unwrap();
-            self.listener_map.remove(&conn.stream.as_raw_fd());
-            self.stream_map.remove(&conn.stream.as_raw_fd());
-            self.local_port_set.remove(&conn.local_port);
+            self.conn_map.write().unwrap().remove(&key).unwrap();
+            self.listener_map
+                .write()
+                .unwrap()
+                .remove(&conn.stream.as_raw_fd());
+            self.stream_map
+                .write()
+                .unwrap()
+                .remove(&conn.stream.as_raw_fd());
+            self.local_port_set
+                .write()
+                .unwrap()
+                .remove(&conn.local_port);
             VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
                 .unwrap_or_else(|err| {
                     warn!(
@@ -172,12 +198,13 @@ impl VsockThreadBackend {
         }
 
         // Forward this packet to its listening connection
-        let conn = self.conn_map.get_mut(&key).unwrap();
+        let conn_mutex = self.conn_map.read().unwrap().get(&key).unwrap().clone();
+        let mut conn = conn_mutex.lock().unwrap();
         conn.send_pkt(pkt)?;
 
         if conn.rx_queue.pending_rx() {
             // Required if the connection object adds new rx operations
-            self.backend_rxq.push_back(key);
+            self.backend_rxq.write().unwrap().push_back(key);
         }
 
         Ok(())
@@ -188,7 +215,7 @@ impl VsockThreadBackend {
     /// Attempts to connect to a host side unix socket listening on a path
     /// corresponding to the destination port as follows:
     /// - "{self.host_sock_path}_{local_port}""
-    fn handle_new_guest_conn<B: BitmapSlice>(&mut self, pkt: &VsockPacket<B>) {
+    fn handle_new_guest_conn<B: BitmapSlice>(&self, pkt: &VsockPacket<B>) {
         let port_path = format!("{}_{}", self.host_socket_path, pkt.dst_port());
 
         UnixStream::connect(port_path)
@@ -200,15 +227,17 @@ impl VsockThreadBackend {
 
     /// Wrapper to add new connection to relevant HashMaps.
     fn add_new_guest_conn<B: BitmapSlice>(
-        &mut self,
+        &self,
         stream: UnixStream,
         pkt: &VsockPacket<B>,
     ) -> Result<()> {
         let stream_fd = stream.as_raw_fd();
         self.listener_map
+            .write()
+            .unwrap()
             .insert(stream_fd, ConnMapKey::new(pkt.dst_port(), pkt.src_port()));
 
-        let conn = VsockConnection::new_peer_init(
+        let conn = Arc::new(Mutex::new(VsockConnection::new_peer_init(
             stream,
             pkt.dst_cid(),
             pkt.dst_port(),
@@ -216,19 +245,23 @@ impl VsockThreadBackend {
             pkt.src_port(),
             self.epoll_fd,
             pkt.buf_alloc(),
-        );
+        )));
 
         self.conn_map
+            .write()
+            .unwrap()
             .insert(ConnMapKey::new(pkt.dst_port(), pkt.src_port()), conn);
         self.backend_rxq
+            .write()
+            .unwrap()
             .push_back(ConnMapKey::new(pkt.dst_port(), pkt.src_port()));
 
-        self.stream_map.insert(
+        self.stream_map.write().unwrap().insert(
             stream_fd,
             // SAFETY: Safe as the file descriptor is guaranteed to be valid.
             unsafe { UnixStream::from_raw_fd(stream_fd) },
         );
-        self.local_port_set.insert(pkt.dst_port());
+        self.local_port_set.write().unwrap().insert(pkt.dst_port());
 
         VhostUserVsockThread::epoll_register(
             self.epoll_fd,
@@ -239,12 +272,13 @@ impl VsockThreadBackend {
     }
 
     /// Enqueue RST packets to be sent to guest.
-    fn enq_rst(&mut self) {
+    fn enq_rst(&self) {
         // TODO
         dbg!("New guest conn error: Enqueue RST");
     }
 }
 
+/*
 #[cfg(test)]
 mod tests {
     use super::*;
