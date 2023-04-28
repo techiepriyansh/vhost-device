@@ -19,7 +19,7 @@ use crate::{
         ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST, VSOCK_OP_RST,
         VSOCK_TYPE_STREAM,
     },
-    vhu_vsock_thread::VhostUserVsockThread,
+    vhu_vsock_thread::EpollHelpers,
     vsock_conn::*,
 };
 
@@ -98,14 +98,15 @@ impl VsockThreadBackend {
                 .write()
                 .unwrap()
                 .remove(&conn.local_port);
-            VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
-                .unwrap_or_else(|err| {
+            EpollHelpers::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd()).unwrap_or_else(
+                |err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
                         conn.stream.as_raw_fd(),
                         err
                     )
-                });
+                },
+            );
 
             // Initialize the packet header to contain a VSOCK_OP_RST operation
             pkt.set_op(VSOCK_OP_RST)
@@ -186,14 +187,15 @@ impl VsockThreadBackend {
                 .write()
                 .unwrap()
                 .remove(&conn.local_port);
-            VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
-                .unwrap_or_else(|err| {
+            EpollHelpers::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd()).unwrap_or_else(
+                |err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
                         conn.stream.as_raw_fd(),
                         err
                     )
-                });
+                },
+            );
             return Ok(());
         }
 
@@ -263,7 +265,7 @@ impl VsockThreadBackend {
         );
         self.local_port_set.write().unwrap().insert(pkt.dst_port());
 
-        VhostUserVsockThread::epoll_register(
+        EpollHelpers::epoll_register(
             self.epoll_fd,
             stream_fd,
             epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
