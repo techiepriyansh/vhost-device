@@ -24,16 +24,6 @@ use crate::vhu_vsock_thread::*;
 const NUM_QUEUES: usize = 2;
 const QUEUE_SIZE: usize = 256;
 
-// New descriptors pending on the rx queue
-const RX_QUEUE_EVENT: u16 = 0;
-// New descriptors are pending on the tx queue.
-const TX_QUEUE_EVENT: u16 = 1;
-// New descriptors are pending on the event queue.
-const EVT_QUEUE_EVENT: u16 = 2;
-
-/// Notification coming from the backend.
-pub(crate) const BACKEND_EVENT: u16 = 3;
-
 /// Vsock connection TX buffer capacity
 /// TODO: Make this value configurable
 pub(crate) const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
@@ -69,7 +59,8 @@ pub(crate) const VSOCK_FLAGS_SHUTDOWN_RCV: u32 = 1;
 pub(crate) const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
 
 // Queue mask to select vrings.
-const QUEUE_MASK: u64 = 0b11;
+const RX_QUEUE_MASK: u64 = 0b01;
+const TX_QUEUE_MASK: u64 = 0b10;
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
@@ -202,24 +193,27 @@ unsafe impl ByteValued for VirtioVsockConfig {}
 
 pub(crate) struct VhostUserVsockBackend {
     config: VirtioVsockConfig,
-    pub threads: Vec<Mutex<VhostUserVsockThread>>,
+    pub threads: Vec<Mutex<Box<dyn VhostUserVsockThread>>>,
     queues_per_thread: Vec<u64>,
     pub exit_event: EventFd,
 }
 
 impl VhostUserVsockBackend {
     pub fn new(config: VsockConfig) -> Result<Self> {
-        let thread = Mutex::new(VhostUserVsockThread::new(
-            config.get_uds_path(),
-            config.get_guest_cid(),
-        )?);
-        let queues_per_thread = vec![QUEUE_MASK];
+        let rx_thread = VhostUserVsockRxThread::new(config.get_uds_path(), config.get_guest_cid())?;
+
+        let tx_thread = VhostUserVsockTxThread::new(rx_thread.thread_backend.clone())?;
+
+        let queues_per_thread = vec![TX_QUEUE_MASK, RX_QUEUE_MASK];
 
         Ok(Self {
             config: VirtioVsockConfig {
                 guest_cid: From::from(config.get_guest_cid()),
             },
-            threads: vec![thread],
+            threads: vec![
+                Mutex::new(Box::new(tx_thread)),
+                Mutex::new(Box::new(rx_thread)),
+            ],
             queues_per_thread,
             exit_event: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?,
         })
@@ -248,13 +242,13 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
 
     fn set_event_idx(&self, enabled: bool) {
         for thread in self.threads.iter() {
-            thread.lock().unwrap().event_idx = enabled;
+            thread.lock().unwrap().set_event_idx(enabled);
         }
     }
 
     fn update_memory(&self, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>) -> IoResult<()> {
         for thread in self.threads.iter() {
-            thread.lock().unwrap().mem = Some(atomic_mem.clone());
+            thread.lock().unwrap().update_memory(atomic_mem.clone());
         }
         Ok(())
     }
@@ -266,36 +260,11 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
         vrings: &[VringRwLock],
         thread_id: usize,
     ) -> IoResult<bool> {
-        let vring_rx = &vrings[0];
-        let vring_tx = &vrings[1];
-
-        if evset != EventSet::IN {
-            return Err(Error::HandleEventNotEpollIn.into());
-        }
-
-        let mut thread = self.threads[thread_id].lock().unwrap();
-        let evt_idx = thread.event_idx;
-
-        match device_event {
-            RX_QUEUE_EVENT => {}
-            TX_QUEUE_EVENT => {
-                thread.process_tx(vring_tx, evt_idx)?;
-            }
-            EVT_QUEUE_EVENT => {}
-            BACKEND_EVENT => {
-                thread.process_backend_evt(evset);
-                thread.process_tx(vring_tx, evt_idx)?;
-            }
-            _ => {
-                return Err(Error::HandleUnknownEvent.into());
-            }
-        }
-
-        if device_event != EVT_QUEUE_EVENT && thread.thread_backend.pending_rx() {
-            thread.process_rx(vring_rx, evt_idx)?;
-        }
-
-        Ok(false)
+        self.threads[thread_id]
+            .lock()
+            .unwrap()
+            .handle_event(device_event, evset, vrings)
+            .map_err(io::Error::from)
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
