@@ -19,7 +19,7 @@ use crate::{
         VSOCK_OP_CREDIT_REQUEST, VSOCK_OP_CREDIT_UPDATE, VSOCK_OP_REQUEST, VSOCK_OP_RESPONSE,
         VSOCK_OP_RST, VSOCK_OP_RW, VSOCK_OP_SHUTDOWN, VSOCK_TYPE_STREAM,
     },
-    vhu_vsock_thread::VhostUserVsockThread,
+    vhu_vsock_thread::EpollHelpers,
 };
 
 #[derive(Debug)]
@@ -167,7 +167,7 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
                         pkt.set_op(VSOCK_OP_RW).set_len(read_cnt as u32);
 
                         // Re-register the stream file descriptor for read and write events
-                        VhostUserVsockThread::epoll_register(
+                        EpollHelpers::epoll_register(
                             self.epoll_fd,
                             self.stream.as_raw_fd(),
                             epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
@@ -239,14 +239,14 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
                 // Already updated the credit
 
                 // Re-register the stream file descriptor for read and write events
-                if VhostUserVsockThread::epoll_modify(
+                if EpollHelpers::epoll_modify(
                     self.epoll_fd,
                     self.stream.as_raw_fd(),
                     epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
                 )
                 .is_err()
                 {
-                    VhostUserVsockThread::epoll_register(
+                    EpollHelpers::epoll_register(
                         self.epoll_fd,
                         self.stream.as_raw_fd(),
                         epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
