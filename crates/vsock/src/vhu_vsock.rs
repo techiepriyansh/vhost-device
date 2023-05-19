@@ -2,7 +2,7 @@
 
 use std::{
     io::{self, Result as IoResult},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     u16, u32, u64, u8,
 };
 
@@ -20,6 +20,7 @@ use vmm_sys_util::{
 };
 
 use crate::vhu_vsock_thread::*;
+use crate::thread_backend::VsockThreadBackend;
 
 const NUM_QUEUES: usize = 2;
 const QUEUE_SIZE: usize = 256;
@@ -196,13 +197,16 @@ pub(crate) struct VhostUserVsockBackend {
     pub threads: Vec<Mutex<Box<dyn VhostUserVsockThread>>>,
     queues_per_thread: Vec<u64>,
     pub exit_event: EventFd,
+    pub thread_backend: Arc<VsockThreadBackend>,
 }
 
 impl VhostUserVsockBackend {
     pub fn new(config: VsockConfig) -> Result<Self> {
         let rx_thread = VhostUserVsockRxThread::new(config.get_uds_path(), config.get_guest_cid())?;
 
-        let tx_thread = VhostUserVsockTxThread::new(rx_thread.thread_backend.clone())?;
+        let thread_backend = rx_thread.thread_backend.clone();
+
+        let tx_thread = VhostUserVsockTxThread::new(thread_backend.clone())?;
 
         let queues_per_thread = vec![TX_QUEUE_MASK, RX_QUEUE_MASK];
 
@@ -216,8 +220,10 @@ impl VhostUserVsockBackend {
             ],
             queues_per_thread,
             exit_event: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?,
+            thread_backend,
         })
     }
+
 }
 
 impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {

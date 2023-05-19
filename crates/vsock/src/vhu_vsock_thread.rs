@@ -270,6 +270,7 @@ impl VhostUserVsockRxThread {
                 // Create a new connection object an enqueue a connection request
                 // packet to be sent to the guest
                 let conn_map_key = ConnMapKey::new(local_port, peer_port);
+                let conn_map_key_clone = conn_map_key.clone();
                 let mut new_conn = VsockConnection::new_local_init(
                     unix_stream,
                     VSOCK_HOST_CID,
@@ -301,6 +302,8 @@ impl VhostUserVsockRxThread {
                     epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
                 )
                 .unwrap();
+
+                println!("New connection from the host: {:?}", conn_map_key_clone);
             } else {
                 // Previously connected connection
                 let key = (*self

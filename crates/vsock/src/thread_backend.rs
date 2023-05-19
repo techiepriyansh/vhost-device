@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
 
 use std::{
+    fs::File,
+    io::prelude::*,
     collections::{HashMap, HashSet, VecDeque},
     os::unix::{
         net::UnixStream,
@@ -23,6 +25,18 @@ use crate::{
     vsock_conn::*,
 };
 
+#[derive(Debug)]
+pub(crate) enum LoggedEventType {
+    RecvEvent,
+    SendEvent,
+}
+
+#[derive(Debug)]
+pub(crate) struct LoggedEvent {
+    conn: ConnMapKey,
+    event_type: LoggedEventType,
+}
+
 pub(crate) struct VsockThreadBackend {
     /// Map of ConnMapKey objects indexed by raw file descriptors.
     pub listener_map: RwLock<HashMap<RawFd, ConnMapKey>>,
@@ -38,6 +52,8 @@ pub(crate) struct VsockThreadBackend {
     epoll_fd: i32,
     /// Set of allocated local ports.
     pub local_port_set: RwLock<HashSet<u32>>,
+    /// Vector of logged events
+    pub logged_events: Mutex<Vec<LoggedEvent>>,
 }
 
 impl VsockThreadBackend {
@@ -53,6 +69,7 @@ impl VsockThreadBackend {
             host_socket_path,
             epoll_fd,
             local_port_set: RwLock::new(HashSet::new()),
+            logged_events: Mutex::new(Vec::new()),
         }
     }
 
@@ -74,6 +91,14 @@ impl VsockThreadBackend {
             .unwrap()
             .pop_front()
             .ok_or(Error::EmptyBackendRxQ)?;
+        
+        // Log the event
+        let mut logged_events = self.logged_events.lock().unwrap();
+        logged_events.push(LoggedEvent {
+            conn: key.clone(),
+            event_type: LoggedEventType::RecvEvent,
+        });
+
         let conn_mutex = match self.conn_map.read().unwrap().get(&key) {
             Some(conn) => conn.clone(),
             None => {
@@ -138,6 +163,13 @@ impl VsockThreadBackend {
     /// - always `Ok(())` if packet has been consumed correctly
     pub fn send_pkt<B: BitmapSlice>(&self, pkt: &VsockPacket<B>) -> Result<()> {
         let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
+
+        // Log the event
+        let mut logged_events = self.logged_events.lock().unwrap();
+        logged_events.push(LoggedEvent {
+            conn: key.clone(),
+            event_type: LoggedEventType::SendEvent,
+        });
 
         // TODO: Rst if packet has unsupported type
         if pkt.type_() != VSOCK_TYPE_STREAM {
@@ -277,6 +309,23 @@ impl VsockThreadBackend {
     fn enq_rst(&self) {
         // TODO
         dbg!("New guest conn error: Enqueue RST");
+    }
+
+    pub fn dump_logged_events(&self) {
+        let mut log_file = File::create("/tmp/vsock.log").expect("Error while creating log file");
+        let mut logged_events = self.logged_events.lock().unwrap();
+        for event in logged_events.drain(..) {
+            match event.event_type  {
+                LoggedEventType::RecvEvent => {
+                    let data = format!("Recv: {:?}\n", event.conn);
+                    log_file.write_all(data.as_bytes()).expect("Error while writing to log file");
+                },
+                LoggedEventType::SendEvent => {
+                    let data = format!("Send: {:?}\n", event.conn);
+                    log_file.write_all(data.as_bytes()).expect("Error while writing to log file");
+                },
+            }
+        }
     }
 }
 

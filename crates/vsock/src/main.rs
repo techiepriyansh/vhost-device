@@ -83,6 +83,8 @@ pub(crate) fn start_backend_server(config: VsockConfig) {
             }
         }
 
+        backend.thread_backend.dump_logged_events();
+
         // No matter the result, we need to shut down the worker thread.
         backend.exit_event.write(1).unwrap();
     }
