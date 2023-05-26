@@ -62,6 +62,7 @@ pub(crate) const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
 // Queue mask to select vrings.
 const RX_QUEUE_MASK: u64 = 0b01;
 const TX_QUEUE_MASK: u64 = 0b10;
+const BACKEND_QUEUE_MASK: u64 = 0b00;
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
@@ -206,18 +207,26 @@ impl VhostUserVsockBackend {
             config.get_guest_cid(),
         )?);
 
-        let rx_thread = VhostUserVsockRxThread::new(thread_backend.clone())?;
-        let tx_thread = VhostUserVsockTxThread::new(thread_backend)?;
+        let rx_event_fd = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
+        let tx_event_fd = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
 
-        let queues_per_thread = vec![TX_QUEUE_MASK, RX_QUEUE_MASK];
+        let rx_thread =
+            VhostUserVsockRxThread::new(thread_backend.clone(), rx_event_fd.try_clone().unwrap())?;
+        let tx_thread =
+            VhostUserVsockTxThread::new(thread_backend.clone(), tx_event_fd.try_clone().unwrap())?;
+        let backend_thread =
+            VhostUserVsockBackendThread::new(thread_backend, rx_event_fd, tx_event_fd)?;
+
+        let queues_per_thread = vec![RX_QUEUE_MASK, TX_QUEUE_MASK, BACKEND_QUEUE_MASK];
 
         Ok(Self {
             config: VirtioVsockConfig {
                 guest_cid: From::from(config.get_guest_cid()),
             },
             threads: vec![
-                Mutex::new(Box::new(tx_thread)),
                 Mutex::new(Box::new(rx_thread)),
+                Mutex::new(Box::new(tx_thread)),
+                Mutex::new(Box::new(backend_thread)),
             ],
             queues_per_thread,
             exit_event: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?,

@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
 
 use std::{
-    fs::File,
     ops::Deref,
-    os::unix::prelude::{AsRawFd, FromRawFd, RawFd},
+    os::unix::prelude::{AsRawFd, RawFd},
     sync::Arc,
 };
 
@@ -13,7 +12,7 @@ use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
 use virtio_queue::QueueOwnedT;
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::{GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
-use vmm_sys_util::epoll::EventSet;
+use vmm_sys_util::{epoll::EventSet, eventfd::EventFd};
 
 use crate::{
     thread_backend::*,
@@ -36,6 +35,9 @@ const THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT: u16 = 0;
 
 /// Notification coming from the backend.
 pub(crate) const BACKEND_EVENT: u16 = 3;
+
+/// Notification coming from the backend thread to the Rx or Tx threads.
+const THREAD_SPECIFIC_CUSTOM_EVENT: u16 = 4;
 
 pub(crate) struct EpollHelpers;
 
@@ -106,38 +108,30 @@ pub(crate) struct VhostUserVsockRxThread {
     pub event_idx: bool,
     /// Instance of VringWorker.
     vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
-    /// epoll fd to which new host connections are added.
-    epoll_file: File,
     /// VsockThreadBackend instance.
-    pub thread_backend: Arc<VsockThreadBackend>,
+    thread_backend: Arc<VsockThreadBackend>,
     /// Thread pool to handle event idx.
     pool: ThreadPool,
+    /// EventFd to signal the thread to process Rx.
+    rx_event_fd: EventFd,
 }
 
 impl VhostUserVsockRxThread {
     /// Create a new instance of VhostUserTxVsockThread.
-    pub fn new(thread_backend: Arc<VsockThreadBackend>) -> Result<Self> {
-        // SAFETY: Safe as the fd is guaranteed to be valid here.
-        let epoll_file = unsafe { File::from_raw_fd(thread_backend.epoll_fd) };
-
+    pub fn new(thread_backend: Arc<VsockThreadBackend>, rx_event_fd: EventFd) -> Result<Self> {
         let thread = VhostUserVsockRxThread {
             mem: None,
             event_idx: false,
             vring_worker: None,
-            epoll_file,
             thread_backend,
             pool: ThreadPoolBuilder::new()
                 .pool_size(1)
                 .create()
                 .map_err(Error::CreateThreadPool)?,
+            rx_event_fd,
         };
 
         Ok(thread)
-    }
-
-    /// Return raw file descriptor of the epoll file.
-    fn get_epoll_fd(&self) -> RawFd {
-        self.epoll_file.as_raw_fd()
     }
 
     /// Iterate over the rx queue and process rx requests.
@@ -257,7 +251,11 @@ impl VhostUserVsockThread for VhostUserVsockRxThread {
         self.vring_worker
             .as_ref()
             .unwrap()
-            .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
+            .register_listener(
+                self.rx_event_fd.as_raw_fd(),
+                EventSet::IN,
+                u64::from(THREAD_SPECIFIC_CUSTOM_EVENT),
+            )
             .unwrap();
     }
 
@@ -274,18 +272,12 @@ impl VhostUserVsockThread for VhostUserVsockRxThread {
         }
 
         match device_event {
-            THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT => {
+            THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT | THREAD_SPECIFIC_CUSTOM_EVENT => {
                 if self.thread_backend.pending_rx() {
                     self.process_rx(vring, self.event_idx)?;
                 }
             }
             EVT_QUEUE_EVENT => {}
-            BACKEND_EVENT => {
-                self.thread_backend.process_backend_event(evset);
-                if self.thread_backend.pending_rx() {
-                    self.process_rx(vring, self.event_idx)?;
-                }
-            }
             _ => {
                 return Err(Error::HandleUnknownEvent);
             }
@@ -303,13 +295,15 @@ pub(crate) struct VhostUserVsockTxThread {
     /// Instance of VringWorker.
     vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
     /// VsockThreadBackend instance.
-    pub thread_backend: Arc<VsockThreadBackend>,
+    thread_backend: Arc<VsockThreadBackend>,
     /// Thread pool to handle event idx.
     pool: ThreadPool,
+    /// EventFd to signal the thread to process Tx.
+    tx_event_fd: EventFd,
 }
 
 impl VhostUserVsockTxThread {
-    pub fn new(thread_backend: Arc<VsockThreadBackend>) -> Result<Self> {
+    pub fn new(thread_backend: Arc<VsockThreadBackend>, tx_event_fd: EventFd) -> Result<Self> {
         let thread = VhostUserVsockTxThread {
             mem: None,
             event_idx: false,
@@ -319,6 +313,7 @@ impl VhostUserVsockTxThread {
                 .pool_size(1)
                 .create()
                 .map_err(Error::CreateThreadPool)?,
+            tx_event_fd,
         };
 
         Ok(thread)
@@ -439,9 +434,9 @@ impl VhostUserVsockThread for VhostUserVsockTxThread {
             .as_ref()
             .unwrap()
             .register_listener(
-                self.thread_backend.epoll_fd,
+                self.tx_event_fd.as_raw_fd(),
                 EventSet::IN,
-                u64::from(BACKEND_EVENT),
+                u64::from(THREAD_SPECIFIC_CUSTOM_EVENT),
             )
             .unwrap();
     }
@@ -459,16 +454,80 @@ impl VhostUserVsockThread for VhostUserVsockTxThread {
         }
 
         match device_event {
-            THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT => {
+            THREAD_SPECIFIC_TX_OR_RX_QUEUE_EVENT | THREAD_SPECIFIC_CUSTOM_EVENT => {
                 self.process_tx(vring, self.event_idx)?;
             }
+            EVT_QUEUE_EVENT => {}
+            _ => {
+                return Err(Error::HandleUnknownEvent);
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+pub(crate) struct VhostUserVsockBackendThread {
+    vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
+    thread_backend: Arc<VsockThreadBackend>,
+    /// EventFd to signal the Rx thread to process Rx.
+    rx_event_fd: EventFd,
+    /// EventFd to signal the Tx thread to process Tx.
+    tx_event_fd: EventFd,
+}
+
+impl VhostUserVsockBackendThread {
+    pub fn new(
+        thread_backend: Arc<VsockThreadBackend>,
+        rx_event_fd: EventFd,
+        tx_event_fd: EventFd,
+    ) -> Result<Self> {
+        Ok(VhostUserVsockBackendThread {
+            vring_worker: None,
+            thread_backend,
+            rx_event_fd,
+            tx_event_fd,
+        })
+    }
+}
+
+impl VhostUserVsockThread for VhostUserVsockBackendThread {
+    fn set_event_idx(&mut self, _enabled: bool) {}
+
+    fn update_memory(&mut self, _atomic_mem: GuestMemoryAtomic<GuestMemoryMmap>) {}
+
+    fn set_vring_worker(
+        &mut self,
+        vring_worker: Option<Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>>,
+    ) {
+        self.vring_worker = vring_worker;
+        self.vring_worker
+            .as_ref()
+            .unwrap()
+            .register_listener(
+                self.thread_backend.epoll_fd,
+                EventSet::IN,
+                u64::from(BACKEND_EVENT),
+            )
+            .unwrap();
+    }
+
+    fn handle_event(
+        &mut self,
+        device_event: u16,
+        evset: EventSet,
+        _vrings: &[VringRwLock],
+    ) -> Result<bool> {
+        if evset != EventSet::IN {
+            return Err(Error::HandleEventNotEpollIn);
+        }
+
+        match device_event {
             BACKEND_EVENT => {
                 self.thread_backend.process_backend_event(evset);
-                if self.thread_backend.pending_rx() {
-                    self.process_tx(vring, self.event_idx)?;
-                }
+                let _ = self.tx_event_fd.write(1);
+                let _ = self.rx_event_fd.write(1);
             }
-            EVT_QUEUE_EVENT => {}
             _ => {
                 return Err(Error::HandleUnknownEvent);
             }
