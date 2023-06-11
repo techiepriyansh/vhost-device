@@ -10,7 +10,7 @@ use std::{
 };
 
 use log::{info, warn};
-use virtio_vsock::packet::VsockPacket;
+use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::bitmap::BitmapSlice;
 
 use crate::{
@@ -22,6 +22,27 @@ use crate::{
     vhu_vsock_thread::VhostUserVsockThread,
     vsock_conn::*,
 };
+
+pub(crate) struct RawVsockPacket {
+    pub header: [u8; PKT_HEADER_SIZE],
+    pub data: Vec<u8>,
+}
+
+impl RawVsockPacket {
+    fn create_from_vsock_packet<B: BitmapSlice>(pkt: &VsockPacket<B>) -> Self {
+        let mut raw_pkt = Self {
+            header: [0; PKT_HEADER_SIZE],
+            data: vec![0; pkt.len() as usize],
+        };
+
+        pkt.header_slice().copy_to(&mut raw_pkt.header);
+        if !pkt.is_empty() {
+            pkt.data_slice().unwrap().copy_to(raw_pkt.data.as_mut());
+        }
+
+        raw_pkt
+    }
+}
 
 pub(crate) struct VsockThreadBackend {
     /// Map of ConnMapKey objects indexed by raw file descriptors.
@@ -41,6 +62,8 @@ pub(crate) struct VsockThreadBackend {
     tx_buffer_size: u32,
     /// Maps the guest CID to the corresponding backend. Used for sibling VM communication.
     cid_bknd_map: Option<Arc<RwLock<CidBkndMap>>>,
+    /// Queue of raw vsock packets recieved from sibling VMs to be sent to the guest.
+    raw_vsock_pkt_queue: VecDeque<RawVsockPacket>,
 }
 
 impl VsockThreadBackend {
@@ -63,6 +86,7 @@ impl VsockThreadBackend {
             local_port_set: HashSet::new(),
             tx_buffer_size,
             cid_bknd_map,
+            raw_vsock_pkt_queue: VecDeque::new(),
         }
     }
 
@@ -131,7 +155,33 @@ impl VsockThreadBackend {
     /// Returns:
     /// - always `Ok(())` if packet has been consumed correctly
     pub fn send_pkt<B: BitmapSlice>(&mut self, pkt: &VsockPacket<B>) -> Result<()> {
-        let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
+        let dst_cid = pkt.dst_cid();
+        if dst_cid != VSOCK_HOST_CID {
+            if self.cid_bknd_map.is_some() {
+                let cid_bknd_map = self.cid_bknd_map.as_ref().unwrap().read().unwrap();
+                if cid_bknd_map.contains_key(&dst_cid) {
+                    let sibling_bknd = cid_bknd_map.get(&dst_cid).unwrap();
+                    sibling_bknd.threads[0]
+                        .lock()
+                        .unwrap()
+                        .thread_backend
+                        .raw_vsock_pkt_queue
+                        .push_back(RawVsockPacket::create_from_vsock_packet(pkt));
+
+                    return Ok(());
+                } else {
+                    warn!("vsock: dropping packet for unknown cid: {:?}", dst_cid);
+                    return Ok(());
+                }
+            } else {
+                info!(
+                    "vsock: dropping packet for cid other than host: {:?}",
+                    pkt.dst_cid()
+                );
+
+                return Ok(());
+            }
+        }
 
         // TODO: Rst if packet has unsupported type
         if pkt.type_() != VSOCK_TYPE_STREAM {
@@ -139,15 +189,7 @@ impl VsockThreadBackend {
             return Ok(());
         }
 
-        // TODO: Handle packets to other CIDs as well
-        if pkt.dst_cid() != VSOCK_HOST_CID {
-            info!(
-                "vsock: dropping packet for cid other than host: {:?}",
-                pkt.dst_cid()
-            );
-
-            return Ok(());
-        }
+        let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
 
         // TODO: Handle cases where connection does not exist and packet op
         // is not VSOCK_OP_REQUEST

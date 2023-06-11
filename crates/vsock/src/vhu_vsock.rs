@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
 
 use std::{
+    collections::HashMap,
     io::{self, Result as IoResult},
     sync::{Arc, Mutex, RwLock},
     u16, u32, u64, u8,
-    collections::HashMap,
 };
 
 use log::warn;
