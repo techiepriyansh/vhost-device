@@ -2,8 +2,9 @@
 
 use std::{
     io::{self, Result as IoResult},
-    sync::Mutex,
+    sync::{Arc, Mutex, RwLock},
     u16, u32, u64, u8,
+    collections::HashMap,
 };
 
 use log::warn;
@@ -21,6 +22,8 @@ use vmm_sys_util::{
 };
 
 use crate::vhu_vsock_thread::*;
+
+pub(crate) type CidBkndMap = HashMap<u64, Arc<VhostUserVsockBackend>>;
 
 const NUM_QUEUES: usize = 2;
 const QUEUE_SIZE: usize = 256;
@@ -211,11 +214,12 @@ pub(crate) struct VhostUserVsockBackend {
 }
 
 impl VhostUserVsockBackend {
-    pub fn new(config: VsockConfig) -> Result<Self> {
+    pub fn new(config: VsockConfig, cid_bknd_map: Option<Arc<RwLock<CidBkndMap>>>) -> Result<Self> {
         let thread = Mutex::new(VhostUserVsockThread::new(
             config.get_uds_path(),
             config.get_guest_cid(),
             config.get_tx_buffer_size(),
+            cid_bknd_map,
         )?);
         let queues_per_thread = vec![QUEUE_MASK];
 
@@ -355,7 +359,7 @@ mod tests {
             CONN_TX_BUF_SIZE,
         );
 
-        let backend = VhostUserVsockBackend::new(config);
+        let backend = VhostUserVsockBackend::new(config, None);
 
         assert!(backend.is_ok());
         let backend = backend.unwrap();
@@ -428,7 +432,7 @@ mod tests {
             CONN_TX_BUF_SIZE,
         );
 
-        let backend = VhostUserVsockBackend::new(config);
+        let backend = VhostUserVsockBackend::new(config, None);
         assert!(backend.is_err());
 
         let config = VsockConfig::new(
@@ -438,7 +442,7 @@ mod tests {
             CONN_TX_BUF_SIZE,
         );
 
-        let backend = VhostUserVsockBackend::new(config).unwrap();
+        let backend = VhostUserVsockBackend::new(config, None).unwrap();
         let mem = GuestMemoryAtomic::new(
             GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
         );

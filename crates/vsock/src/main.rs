@@ -8,9 +8,14 @@ mod vhu_vsock;
 mod vhu_vsock_thread;
 mod vsock_conn;
 
-use std::{convert::TryFrom, sync::Arc, thread};
+use std::{
+    collections::HashMap,
+    convert::TryFrom,
+    sync::{Arc, RwLock},
+    thread,
+};
 
-use crate::vhu_vsock::{VhostUserVsockBackend, VsockConfig};
+use crate::vhu_vsock::{CidBkndMap, VhostUserVsockBackend, VsockConfig};
 use clap::{Args, Parser};
 use log::{info, warn};
 use serde::Deserialize;
@@ -172,9 +177,13 @@ impl TryFrom<VsockArgs> for Vec<VsockConfig> {
 
 /// This is the public API through which an external program starts the
 /// vhost-user-vsock backend server.
-pub(crate) fn start_backend_server(config: VsockConfig) {
+pub(crate) fn start_backend_server(
+    config: VsockConfig,
+    cid_bknd_map: Option<Arc<RwLock<CidBkndMap>>>,
+) {
     loop {
-        let backend = Arc::new(VhostUserVsockBackend::new(config.clone()).unwrap());
+        let backend =
+            Arc::new(VhostUserVsockBackend::new(config.clone(), cid_bknd_map.clone()).unwrap());
 
         let listener = Listener::new(config.get_socket_path(), true).unwrap();
 
@@ -214,13 +223,16 @@ pub(crate) fn start_backend_server(config: VsockConfig) {
 }
 
 pub(crate) fn start_backend_servers(configs: &[VsockConfig]) {
+    let cid_bknd_map: Arc<RwLock<HashMap<u64, Arc<VhostUserVsockBackend>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
     let mut handles = Vec::new();
 
     for c in configs.iter() {
         let config = c.clone();
+        let cid_bknd_map = cid_bknd_map.clone();
         let handle = thread::Builder::new()
             .name(format!("vhu-vsock-cid-{}", c.get_guest_cid()))
-            .spawn(move || start_backend_server(config))
+            .spawn(move || start_backend_server(config, Some(cid_bknd_map)))
             .unwrap();
         handles.push(handle);
     }
@@ -242,7 +254,7 @@ fn main() {
     };
 
     if configs.len() == 1 {
-        start_backend_server(configs.pop().unwrap());
+        start_backend_server(configs.pop().unwrap(), None);
     } else {
         start_backend_servers(&configs);
     }
@@ -371,7 +383,7 @@ mod tests {
             CONN_TX_BUF_SIZE,
         );
 
-        let backend = Arc::new(VhostUserVsockBackend::new(config).unwrap());
+        let backend = Arc::new(VhostUserVsockBackend::new(config, None).unwrap());
 
         let daemon = VhostUserDaemon::new(
             String::from("vhost-user-vsock"),

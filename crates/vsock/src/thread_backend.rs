@@ -6,6 +6,7 @@ use std::{
         net::UnixStream,
         prelude::{AsRawFd, FromRawFd, RawFd},
     },
+    sync::{Arc, RwLock},
 };
 
 use log::{info, warn};
@@ -15,7 +16,7 @@ use vm_memory::bitmap::BitmapSlice;
 use crate::{
     rxops::*,
     vhu_vsock::{
-        ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST, VSOCK_OP_RST,
+        CidBkndMap, ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST, VSOCK_OP_RST,
         VSOCK_TYPE_STREAM,
     },
     vhu_vsock_thread::VhostUserVsockThread,
@@ -38,11 +39,18 @@ pub(crate) struct VsockThreadBackend {
     /// Set of allocated local ports.
     pub local_port_set: HashSet<u32>,
     tx_buffer_size: u32,
+    /// Maps the guest CID to the corresponding backend. Used for sibling VM communication.
+    cid_bknd_map: Option<Arc<RwLock<CidBkndMap>>>,
 }
 
 impl VsockThreadBackend {
     /// New instance of VsockThreadBackend.
-    pub fn new(host_socket_path: String, epoll_fd: i32, tx_buffer_size: u32) -> Self {
+    pub fn new(
+        host_socket_path: String,
+        epoll_fd: i32,
+        tx_buffer_size: u32,
+        cid_bknd_map: Option<Arc<RwLock<CidBkndMap>>>,
+    ) -> Self {
         Self {
             listener_map: HashMap::new(),
             conn_map: HashMap::new(),
@@ -54,6 +62,7 @@ impl VsockThreadBackend {
             epoll_fd,
             local_port_set: HashSet::new(),
             tx_buffer_size,
+            cid_bknd_map,
         }
     }
 
@@ -270,8 +279,12 @@ mod tests {
         let _listener = UnixListener::bind(VSOCK_PEER_PATH).unwrap();
 
         let epoll_fd = epoll::create(false).unwrap();
-        let mut vtp =
-            VsockThreadBackend::new(VSOCK_SOCKET_PATH.to_string(), epoll_fd, CONN_TX_BUF_SIZE);
+        let mut vtp = VsockThreadBackend::new(
+            VSOCK_SOCKET_PATH.to_string(),
+            epoll_fd,
+            CONN_TX_BUF_SIZE,
+            None,
+        );
 
         assert!(!vtp.pending_rx());
 

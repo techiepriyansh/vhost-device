@@ -10,7 +10,7 @@ use std::{
         net::{UnixListener, UnixStream},
         prelude::{AsRawFd, FromRawFd, RawFd},
     },
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
@@ -24,7 +24,9 @@ use vmm_sys_util::epoll::EventSet;
 use crate::{
     rxops::*,
     thread_backend::*,
-    vhu_vsock::{ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT, VSOCK_HOST_CID},
+    vhu_vsock::{
+        CidBkndMap, ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT, VSOCK_HOST_CID,
+    },
     vsock_conn::*,
 };
 
@@ -59,7 +61,12 @@ pub(crate) struct VhostUserVsockThread {
 
 impl VhostUserVsockThread {
     /// Create a new instance of VhostUserVsockThread.
-    pub fn new(uds_path: String, guest_cid: u64, tx_buffer_size: u32) -> Result<Self> {
+    pub fn new(
+        uds_path: String,
+        guest_cid: u64,
+        tx_buffer_size: u32,
+        cid_bknd_map: Option<Arc<RwLock<CidBkndMap>>>,
+    ) -> Result<Self> {
         // TODO: better error handling, maybe add a param to force the unlink
         let _ = std::fs::remove_file(uds_path.clone());
         let host_sock = UnixListener::bind(&uds_path)
@@ -80,7 +87,12 @@ impl VhostUserVsockThread {
             host_listener: host_sock,
             vring_worker: None,
             epoll_file,
-            thread_backend: VsockThreadBackend::new(uds_path, epoll_fd, tx_buffer_size),
+            thread_backend: VsockThreadBackend::new(
+                uds_path,
+                epoll_fd,
+                tx_buffer_size,
+                cid_bknd_map,
+            ),
             guest_cid,
             pool: ThreadPoolBuilder::new()
                 .pool_size(1)
@@ -606,8 +618,12 @@ mod tests {
     #[test]
     #[serial]
     fn test_vsock_thread() {
-        let t =
-            VhostUserVsockThread::new("test_vsock_thread.vsock".to_string(), 3, CONN_TX_BUF_SIZE);
+        let t = VhostUserVsockThread::new(
+            "test_vsock_thread.vsock".to_string(),
+            3,
+            CONN_TX_BUF_SIZE,
+            None,
+        );
         assert!(t.is_ok());
 
         let mut t = t.unwrap();
@@ -662,14 +678,19 @@ mod tests {
     #[test]
     #[serial]
     fn test_vsock_thread_failures() {
-        let t =
-            VhostUserVsockThread::new("/sys/not_allowed.vsock".to_string(), 3, CONN_TX_BUF_SIZE);
+        let t = VhostUserVsockThread::new(
+            "/sys/not_allowed.vsock".to_string(),
+            3,
+            CONN_TX_BUF_SIZE,
+            None,
+        );
         assert!(t.is_err());
 
         let mut t = VhostUserVsockThread::new(
             "test_vsock_thread_failures.vsock".to_string(),
             3,
             CONN_TX_BUF_SIZE,
+            None,
         )
         .unwrap();
         assert!(VhostUserVsockThread::epoll_register(-1, -1, epoll::Events::EPOLLIN).is_err());
