@@ -38,6 +38,9 @@ const EVT_QUEUE_EVENT: u16 = 2;
 /// Notification coming from the backend.
 pub(crate) const BACKEND_EVENT: u16 = 3;
 
+/// Notification coming from the sibling VM.
+pub(crate) const SIBLING_VM_EVENT: u16 = 4;
+
 /// CID of the host
 pub(crate) const VSOCK_HOST_CID: u64 = 2;
 

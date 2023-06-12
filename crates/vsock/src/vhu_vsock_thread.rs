@@ -19,13 +19,17 @@ use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
 use virtio_queue::QueueOwnedT;
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::{GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
-use vmm_sys_util::epoll::EventSet;
+use vmm_sys_util::{
+    epoll::EventSet,
+    eventfd::{EventFd, EFD_NONBLOCK},
+};
 
 use crate::{
     rxops::*,
     thread_backend::*,
     vhu_vsock::{
-        CidBkndMap, ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT, VSOCK_HOST_CID,
+        CidBkndMap, ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT,
+        SIBLING_VM_EVENT, VSOCK_HOST_CID,
     },
     vsock_conn::*,
 };
@@ -57,6 +61,9 @@ pub(crate) struct VhostUserVsockThread {
     local_port: Wrapping<u32>,
     /// The tx buffer size
     tx_buffer_size: u32,
+    /// EventFd to notify this thread for custom events. Currently used to notify
+    /// this thread to process raw vsock packets sent from a sibling VM.
+    pub thread_event_fd: EventFd,
 }
 
 impl VhostUserVsockThread {
@@ -79,6 +86,8 @@ impl VhostUserVsockThread {
 
         let host_raw_fd = host_sock.as_raw_fd();
 
+        let thread_event_fd = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
+
         let thread = VhostUserVsockThread {
             mem: None,
             event_idx: false,
@@ -100,6 +109,7 @@ impl VhostUserVsockThread {
                 .map_err(Error::CreateThreadPool)?,
             local_port: Wrapping(0),
             tx_buffer_size,
+            thread_event_fd,
         };
 
         VhostUserVsockThread::epoll_register(epoll_fd, host_raw_fd, epoll::Events::EPOLLIN)?;
@@ -161,6 +171,15 @@ impl VhostUserVsockThread {
             .as_ref()
             .unwrap()
             .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
+            .unwrap();
+        self.vring_worker
+            .as_ref()
+            .unwrap()
+            .register_listener(
+                self.thread_event_fd.as_raw_fd(),
+                EventSet::IN,
+                u64::from(SIBLING_VM_EVENT),
+            )
             .unwrap();
     }
 

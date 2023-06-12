@@ -161,12 +161,13 @@ impl VsockThreadBackend {
                 let cid_bknd_map = self.cid_bknd_map.as_ref().unwrap().read().unwrap();
                 if cid_bknd_map.contains_key(&dst_cid) {
                     let sibling_bknd = cid_bknd_map.get(&dst_cid).unwrap();
-                    sibling_bknd.threads[0]
-                        .lock()
-                        .unwrap()
+                    let mut sibling_bknd_thread = sibling_bknd.threads[0].lock().unwrap();
+
+                    sibling_bknd_thread
                         .thread_backend
                         .raw_vsock_pkt_queue
                         .push_back(RawVsockPacket::create_from_vsock_packet(pkt));
+                    let _ = sibling_bknd_thread.thread_event_fd.write(1);
 
                     return Ok(());
                 } else {
