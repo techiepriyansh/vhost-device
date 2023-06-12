@@ -129,6 +129,8 @@ pub(crate) enum Error {
     EmptyBackendRxQ,
     #[error("Failed to create an EventFd")]
     EventFdCreate(std::io::Error),
+    #[error("Raw vsock packets queue is empty")]
+    EmptyRawVsockPktsQueue,
 }
 
 impl std::convert::From<Error> for std::io::Error {
@@ -288,6 +290,11 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
         let evt_idx = thread.event_idx;
 
         match device_event {
+            SIBLING_VM_EVENT => {
+                let _ = thread.thread_event_fd.read();
+                thread.process_raw_vsock_pkts(vring_rx, evt_idx)?;
+                return Ok(false);
+            }
             RX_QUEUE_EVENT => {}
             TX_QUEUE_EVENT => {
                 thread.process_tx(vring_tx, evt_idx)?;
@@ -469,7 +476,7 @@ mod tests {
         );
         assert_eq!(
             backend
-                .handle_event(BACKEND_EVENT + 1, EventSet::IN, &vrings, 0)
+                .handle_event(SIBLING_VM_EVENT + 1, EventSet::IN, &vrings, 0)
                 .unwrap_err()
                 .to_string(),
             Error::HandleUnknownEvent.to_string()

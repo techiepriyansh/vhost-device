@@ -184,6 +184,10 @@ pub(crate) fn start_backend_server(
     loop {
         let backend =
             Arc::new(VhostUserVsockBackend::new(config.clone(), cid_bknd_map.clone()).unwrap());
+        if cid_bknd_map.is_some() {
+            let mut cid_bknd_map = cid_bknd_map.as_ref().unwrap().write().unwrap();
+            cid_bknd_map.insert(config.get_guest_cid(), backend.clone());
+        }
 
         let listener = Listener::new(config.get_socket_path(), true).unwrap();
 
@@ -219,6 +223,10 @@ pub(crate) fn start_backend_server(
 
         // No matter the result, we need to shut down the worker thread.
         backend.exit_event.write(1).unwrap();
+        if cid_bknd_map.is_some() {
+            let mut cid_bknd_map = cid_bknd_map.as_ref().unwrap().write().unwrap();
+            cid_bknd_map.remove(&config.get_guest_cid());
+        }
     }
 }
 

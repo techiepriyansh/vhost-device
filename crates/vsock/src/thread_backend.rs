@@ -29,7 +29,7 @@ pub(crate) struct RawVsockPacket {
 }
 
 impl RawVsockPacket {
-    fn create_from_vsock_packet<B: BitmapSlice>(pkt: &VsockPacket<B>) -> Self {
+    fn create_from_vsock_packet<B: BitmapSlice>(pkt: &VsockPacket<B>) -> Result<Self> {
         let mut raw_pkt = Self {
             header: [0; PKT_HEADER_SIZE],
             data: vec![0; pkt.len() as usize],
@@ -37,10 +37,12 @@ impl RawVsockPacket {
 
         pkt.header_slice().copy_to(&mut raw_pkt.header);
         if !pkt.is_empty() {
-            pkt.data_slice().unwrap().copy_to(raw_pkt.data.as_mut());
+            pkt.data_slice()
+                .ok_or(Error::PktBufMissing)?
+                .copy_to(raw_pkt.data.as_mut());
         }
 
-        raw_pkt
+        Ok(raw_pkt)
     }
 }
 
@@ -93,6 +95,11 @@ impl VsockThreadBackend {
     /// Checks if there are pending rx requests in the backend rxq.
     pub fn pending_rx(&self) -> bool {
         !self.backend_rxq.is_empty()
+    }
+
+    /// Checks if there are pending raw vsock packets to be sent to the guest.
+    pub fn pending_raw_vsock_pkts(&self) -> bool {
+        !self.raw_vsock_pkt_queue.is_empty()
     }
 
     /// Deliver a vsock packet to the guest vsock driver.
@@ -166,7 +173,7 @@ impl VsockThreadBackend {
                     sibling_bknd_thread
                         .thread_backend
                         .raw_vsock_pkt_queue
-                        .push_back(RawVsockPacket::create_from_vsock_packet(pkt));
+                        .push_back(RawVsockPacket::create_from_vsock_packet(pkt)?);
                     let _ = sibling_bknd_thread.thread_event_fd.write(1);
 
                     return Ok(());
@@ -232,6 +239,26 @@ impl VsockThreadBackend {
         if conn.rx_queue.pending_rx() {
             // Required if the connection object adds new rx operations
             self.backend_rxq.push_back(key);
+        }
+
+        Ok(())
+    }
+
+    /// Deliver a raw vsock packet sent from a sibling VM to the guest vsock driver.
+    ///
+    /// Returns:
+    /// - `Ok(())` if packet was successfully filled in
+    /// - `Err(Error::EmptyRawVsockPktsQueue)` if there was no available data
+    pub fn recv_raw_vsock_pkt<B: BitmapSlice>(&mut self, pkt: &mut VsockPacket<B>) -> Result<()> {
+        let raw_vsock_pkt = self
+            .raw_vsock_pkt_queue
+            .pop_front()
+            .ok_or(Error::EmptyRawVsockPktsQueue)?;
+
+        pkt.set_header_from_raw(&raw_vsock_pkt.header).unwrap();
+        if !raw_vsock_pkt.data.is_empty() {
+            let buf = pkt.data_slice().ok_or(Error::PktBufMissing)?;
+            buf.copy_from(&raw_vsock_pkt.data);
         }
 
         Ok(())

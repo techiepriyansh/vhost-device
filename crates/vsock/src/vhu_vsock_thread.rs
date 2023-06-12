@@ -612,6 +612,100 @@ impl VhostUserVsockThread {
         }
         Ok(false)
     }
+
+    pub fn process_raw_vsock_pkts_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
+        let mut used_any = false;
+        let atomic_mem = match &self.mem {
+            Some(m) => m,
+            None => return Err(Error::NoMemoryConfigured),
+        };
+
+        let mut vring_mut = vring.get_mut();
+
+        let queue = vring_mut.get_queue_mut();
+
+        while let Some(mut avail_desc) = queue
+            .iter(atomic_mem.memory())
+            .map_err(|_| Error::IterateQueue)?
+            .next()
+        {
+            used_any = true;
+            let mem = atomic_mem.clone().memory();
+
+            let head_idx = avail_desc.head_index();
+            let used_len = match VsockPacket::from_rx_virtq_chain(
+                mem.deref(),
+                &mut avail_desc,
+                self.tx_buffer_size,
+            ) {
+                Ok(mut pkt) => {
+                    if self.thread_backend.recv_raw_vsock_pkt(&mut pkt).is_ok() {
+                        PKT_HEADER_SIZE + pkt.len() as usize
+                    } else {
+                        queue.iter(mem).unwrap().go_to_previous_position();
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("vsock: RX queue error while sending raw vsock packets from a sibling VM: {:?}", e);
+                    0
+                }
+            };
+
+            let vring = vring.clone();
+            let event_idx = self.event_idx;
+
+            self.pool.spawn_ok(async move {
+                // TODO: Understand why doing the following in the pool works
+                if event_idx {
+                    if vring.add_used(head_idx, used_len as u32).is_err() {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    match vring.needs_notification() {
+                        Err(_) => {
+                            warn!("Could not check if queue needs to be notified");
+                            vring.signal_used_queue().unwrap();
+                        }
+                        Ok(needs_notification) => {
+                            if needs_notification {
+                                vring.signal_used_queue().unwrap();
+                            }
+                        }
+                    }
+                } else {
+                    if vring.add_used(head_idx, used_len as u32).is_err() {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    vring.signal_used_queue().unwrap();
+                }
+            });
+
+            if !self.thread_backend.pending_raw_vsock_pkts() {
+                break;
+            }
+        }
+        Ok(used_any)
+    }
+
+    /// Wrapper to process raw vsock packets queue based on whether event idx is enabled or not.
+    pub fn process_raw_vsock_pkts(&mut self, vring: &VringRwLock, event_idx: bool) -> Result<bool> {
+        if event_idx {
+            loop {
+                if !self.thread_backend.pending_raw_vsock_pkts() {
+                    break;
+                }
+                vring.disable_notification().unwrap();
+
+                self.process_raw_vsock_pkts_queue(vring)?;
+                if !vring.enable_notification().unwrap() {
+                    break;
+                }
+            }
+        } else {
+            self.process_raw_vsock_pkts_queue(vring)?;
+        }
+        Ok(false)
+    }
 }
 
 impl Drop for VhostUserVsockThread {
