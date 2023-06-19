@@ -6,21 +6,45 @@ use std::{
         net::UnixStream,
         prelude::{AsRawFd, FromRawFd, RawFd},
     },
+    sync::{Arc, RwLock},
 };
 
 use log::{info, warn};
-use virtio_vsock::packet::VsockPacket;
+use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::bitmap::BitmapSlice;
 
 use crate::{
     rxops::*,
     vhu_vsock::{
-        ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST, VSOCK_OP_RST,
+        CidBkndMap, ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST, VSOCK_OP_RST,
         VSOCK_TYPE_STREAM,
     },
     vhu_vsock_thread::VhostUserVsockThread,
     vsock_conn::*,
 };
+
+pub(crate) struct RawVsockPacket {
+    pub header: [u8; PKT_HEADER_SIZE],
+    pub data: Vec<u8>,
+}
+
+impl RawVsockPacket {
+    fn create_from_vsock_packet<B: BitmapSlice>(pkt: &VsockPacket<B>) -> Result<Self> {
+        let mut raw_pkt = Self {
+            header: [0; PKT_HEADER_SIZE],
+            data: vec![0; pkt.len() as usize],
+        };
+
+        pkt.header_slice().copy_to(&mut raw_pkt.header);
+        if !pkt.is_empty() {
+            pkt.data_slice()
+                .ok_or(Error::PktBufMissing)?
+                .copy_to(raw_pkt.data.as_mut());
+        }
+
+        Ok(raw_pkt)
+    }
+}
 
 pub(crate) struct VsockThreadBackend {
     /// Map of ConnMapKey objects indexed by raw file descriptors.
@@ -38,11 +62,20 @@ pub(crate) struct VsockThreadBackend {
     /// Set of allocated local ports.
     pub local_port_set: HashSet<u32>,
     tx_buffer_size: u32,
+    /// Maps the guest CID to the corresponding backend. Used for sibling VM communication.
+    cid_bknd_map: Option<Arc<RwLock<CidBkndMap>>>,
+    /// Queue of raw vsock packets recieved from sibling VMs to be sent to the guest.
+    raw_vsock_pkt_queue: VecDeque<RawVsockPacket>,
 }
 
 impl VsockThreadBackend {
     /// New instance of VsockThreadBackend.
-    pub fn new(host_socket_path: String, epoll_fd: i32, tx_buffer_size: u32) -> Self {
+    pub fn new(
+        host_socket_path: String,
+        epoll_fd: i32,
+        tx_buffer_size: u32,
+        cid_bknd_map: Option<Arc<RwLock<CidBkndMap>>>,
+    ) -> Self {
         Self {
             listener_map: HashMap::new(),
             conn_map: HashMap::new(),
@@ -54,12 +87,19 @@ impl VsockThreadBackend {
             epoll_fd,
             local_port_set: HashSet::new(),
             tx_buffer_size,
+            cid_bknd_map,
+            raw_vsock_pkt_queue: VecDeque::new(),
         }
     }
 
     /// Checks if there are pending rx requests in the backend rxq.
     pub fn pending_rx(&self) -> bool {
         !self.backend_rxq.is_empty()
+    }
+
+    /// Checks if there are pending raw vsock packets to be sent to the guest.
+    pub fn pending_raw_vsock_pkts(&self) -> bool {
+        !self.raw_vsock_pkt_queue.is_empty()
     }
 
     /// Deliver a vsock packet to the guest vsock driver.
@@ -122,7 +162,34 @@ impl VsockThreadBackend {
     /// Returns:
     /// - always `Ok(())` if packet has been consumed correctly
     pub fn send_pkt<B: BitmapSlice>(&mut self, pkt: &VsockPacket<B>) -> Result<()> {
-        let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
+        let dst_cid = pkt.dst_cid();
+        if dst_cid != VSOCK_HOST_CID {
+            if self.cid_bknd_map.is_some() {
+                let cid_bknd_map = self.cid_bknd_map.as_ref().unwrap().read().unwrap();
+                if cid_bknd_map.contains_key(&dst_cid) {
+                    let sibling_bknd = cid_bknd_map.get(&dst_cid).unwrap();
+                    let mut sibling_bknd_thread = sibling_bknd.threads[0].lock().unwrap();
+
+                    sibling_bknd_thread
+                        .thread_backend
+                        .raw_vsock_pkt_queue
+                        .push_back(RawVsockPacket::create_from_vsock_packet(pkt)?);
+                    let _ = sibling_bknd_thread.thread_event_fd.write(1);
+
+                    return Ok(());
+                } else {
+                    warn!("vsock: dropping packet for unknown cid: {:?}", dst_cid);
+                    return Ok(());
+                }
+            } else {
+                info!(
+                    "vsock: dropping packet for cid other than host: {:?}",
+                    pkt.dst_cid()
+                );
+
+                return Ok(());
+            }
+        }
 
         // TODO: Rst if packet has unsupported type
         if pkt.type_() != VSOCK_TYPE_STREAM {
@@ -130,15 +197,7 @@ impl VsockThreadBackend {
             return Ok(());
         }
 
-        // TODO: Handle packets to other CIDs as well
-        if pkt.dst_cid() != VSOCK_HOST_CID {
-            info!(
-                "vsock: dropping packet for cid other than host: {:?}",
-                pkt.dst_cid()
-            );
-
-            return Ok(());
-        }
+        let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
 
         // TODO: Handle cases where connection does not exist and packet op
         // is not VSOCK_OP_REQUEST
@@ -180,6 +239,26 @@ impl VsockThreadBackend {
         if conn.rx_queue.pending_rx() {
             // Required if the connection object adds new rx operations
             self.backend_rxq.push_back(key);
+        }
+
+        Ok(())
+    }
+
+    /// Deliver a raw vsock packet sent from a sibling VM to the guest vsock driver.
+    ///
+    /// Returns:
+    /// - `Ok(())` if packet was successfully filled in
+    /// - `Err(Error::EmptyRawVsockPktsQueue)` if there was no available data
+    pub fn recv_raw_vsock_pkt<B: BitmapSlice>(&mut self, pkt: &mut VsockPacket<B>) -> Result<()> {
+        let raw_vsock_pkt = self
+            .raw_vsock_pkt_queue
+            .pop_front()
+            .ok_or(Error::EmptyRawVsockPktsQueue)?;
+
+        pkt.set_header_from_raw(&raw_vsock_pkt.header).unwrap();
+        if !raw_vsock_pkt.data.is_empty() {
+            let buf = pkt.data_slice().ok_or(Error::PktBufMissing)?;
+            buf.copy_from(&raw_vsock_pkt.data);
         }
 
         Ok(())
@@ -270,8 +349,12 @@ mod tests {
         let _listener = UnixListener::bind(VSOCK_PEER_PATH).unwrap();
 
         let epoll_fd = epoll::create(false).unwrap();
-        let mut vtp =
-            VsockThreadBackend::new(VSOCK_SOCKET_PATH.to_string(), epoll_fd, CONN_TX_BUF_SIZE);
+        let mut vtp = VsockThreadBackend::new(
+            VSOCK_SOCKET_PATH.to_string(),
+            epoll_fd,
+            CONN_TX_BUF_SIZE,
+            None,
+        );
 
         assert!(!vtp.pending_rx());
 

@@ -10,7 +10,7 @@ use std::{
         net::{UnixListener, UnixStream},
         prelude::{AsRawFd, FromRawFd, RawFd},
     },
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
@@ -19,12 +19,18 @@ use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
 use virtio_queue::QueueOwnedT;
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::{GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
-use vmm_sys_util::epoll::EventSet;
+use vmm_sys_util::{
+    epoll::EventSet,
+    eventfd::{EventFd, EFD_NONBLOCK},
+};
 
 use crate::{
     rxops::*,
     thread_backend::*,
-    vhu_vsock::{ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT, VSOCK_HOST_CID},
+    vhu_vsock::{
+        CidBkndMap, ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT,
+        SIBLING_VM_EVENT, VSOCK_HOST_CID,
+    },
     vsock_conn::*,
 };
 
@@ -55,11 +61,19 @@ pub(crate) struct VhostUserVsockThread {
     local_port: Wrapping<u32>,
     /// The tx buffer size
     tx_buffer_size: u32,
+    /// EventFd to notify this thread for custom events. Currently used to notify
+    /// this thread to process raw vsock packets sent from a sibling VM.
+    pub thread_event_fd: EventFd,
 }
 
 impl VhostUserVsockThread {
     /// Create a new instance of VhostUserVsockThread.
-    pub fn new(uds_path: String, guest_cid: u64, tx_buffer_size: u32) -> Result<Self> {
+    pub fn new(
+        uds_path: String,
+        guest_cid: u64,
+        tx_buffer_size: u32,
+        cid_bknd_map: Option<Arc<RwLock<CidBkndMap>>>,
+    ) -> Result<Self> {
         // TODO: better error handling, maybe add a param to force the unlink
         let _ = std::fs::remove_file(uds_path.clone());
         let host_sock = UnixListener::bind(&uds_path)
@@ -72,6 +86,8 @@ impl VhostUserVsockThread {
 
         let host_raw_fd = host_sock.as_raw_fd();
 
+        let thread_event_fd = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
+
         let thread = VhostUserVsockThread {
             mem: None,
             event_idx: false,
@@ -80,7 +96,12 @@ impl VhostUserVsockThread {
             host_listener: host_sock,
             vring_worker: None,
             epoll_file,
-            thread_backend: VsockThreadBackend::new(uds_path, epoll_fd, tx_buffer_size),
+            thread_backend: VsockThreadBackend::new(
+                uds_path,
+                epoll_fd,
+                tx_buffer_size,
+                cid_bknd_map,
+            ),
             guest_cid,
             pool: ThreadPoolBuilder::new()
                 .pool_size(1)
@@ -88,6 +109,7 @@ impl VhostUserVsockThread {
                 .map_err(Error::CreateThreadPool)?,
             local_port: Wrapping(0),
             tx_buffer_size,
+            thread_event_fd,
         };
 
         VhostUserVsockThread::epoll_register(epoll_fd, host_raw_fd, epoll::Events::EPOLLIN)?;
@@ -149,6 +171,15 @@ impl VhostUserVsockThread {
             .as_ref()
             .unwrap()
             .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
+            .unwrap();
+        self.vring_worker
+            .as_ref()
+            .unwrap()
+            .register_listener(
+                self.thread_event_fd.as_raw_fd(),
+                EventSet::IN,
+                u64::from(SIBLING_VM_EVENT),
+            )
             .unwrap();
     }
 
@@ -581,6 +612,100 @@ impl VhostUserVsockThread {
         }
         Ok(false)
     }
+
+    pub fn process_raw_vsock_pkts_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
+        let mut used_any = false;
+        let atomic_mem = match &self.mem {
+            Some(m) => m,
+            None => return Err(Error::NoMemoryConfigured),
+        };
+
+        let mut vring_mut = vring.get_mut();
+
+        let queue = vring_mut.get_queue_mut();
+
+        while let Some(mut avail_desc) = queue
+            .iter(atomic_mem.memory())
+            .map_err(|_| Error::IterateQueue)?
+            .next()
+        {
+            used_any = true;
+            let mem = atomic_mem.clone().memory();
+
+            let head_idx = avail_desc.head_index();
+            let used_len = match VsockPacket::from_rx_virtq_chain(
+                mem.deref(),
+                &mut avail_desc,
+                self.tx_buffer_size,
+            ) {
+                Ok(mut pkt) => {
+                    if self.thread_backend.recv_raw_vsock_pkt(&mut pkt).is_ok() {
+                        PKT_HEADER_SIZE + pkt.len() as usize
+                    } else {
+                        queue.iter(mem).unwrap().go_to_previous_position();
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("vsock: RX queue error while sending raw vsock packets from a sibling VM: {:?}", e);
+                    0
+                }
+            };
+
+            let vring = vring.clone();
+            let event_idx = self.event_idx;
+
+            self.pool.spawn_ok(async move {
+                // TODO: Understand why doing the following in the pool works
+                if event_idx {
+                    if vring.add_used(head_idx, used_len as u32).is_err() {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    match vring.needs_notification() {
+                        Err(_) => {
+                            warn!("Could not check if queue needs to be notified");
+                            vring.signal_used_queue().unwrap();
+                        }
+                        Ok(needs_notification) => {
+                            if needs_notification {
+                                vring.signal_used_queue().unwrap();
+                            }
+                        }
+                    }
+                } else {
+                    if vring.add_used(head_idx, used_len as u32).is_err() {
+                        warn!("Could not return used descriptors to ring");
+                    }
+                    vring.signal_used_queue().unwrap();
+                }
+            });
+
+            if !self.thread_backend.pending_raw_vsock_pkts() {
+                break;
+            }
+        }
+        Ok(used_any)
+    }
+
+    /// Wrapper to process raw vsock packets queue based on whether event idx is enabled or not.
+    pub fn process_raw_vsock_pkts(&mut self, vring: &VringRwLock, event_idx: bool) -> Result<bool> {
+        if event_idx {
+            loop {
+                if !self.thread_backend.pending_raw_vsock_pkts() {
+                    break;
+                }
+                vring.disable_notification().unwrap();
+
+                self.process_raw_vsock_pkts_queue(vring)?;
+                if !vring.enable_notification().unwrap() {
+                    break;
+                }
+            }
+        } else {
+            self.process_raw_vsock_pkts_queue(vring)?;
+        }
+        Ok(false)
+    }
 }
 
 impl Drop for VhostUserVsockThread {
@@ -606,8 +731,12 @@ mod tests {
     #[test]
     #[serial]
     fn test_vsock_thread() {
-        let t =
-            VhostUserVsockThread::new("test_vsock_thread.vsock".to_string(), 3, CONN_TX_BUF_SIZE);
+        let t = VhostUserVsockThread::new(
+            "test_vsock_thread.vsock".to_string(),
+            3,
+            CONN_TX_BUF_SIZE,
+            None,
+        );
         assert!(t.is_ok());
 
         let mut t = t.unwrap();
@@ -662,14 +791,19 @@ mod tests {
     #[test]
     #[serial]
     fn test_vsock_thread_failures() {
-        let t =
-            VhostUserVsockThread::new("/sys/not_allowed.vsock".to_string(), 3, CONN_TX_BUF_SIZE);
+        let t = VhostUserVsockThread::new(
+            "/sys/not_allowed.vsock".to_string(),
+            3,
+            CONN_TX_BUF_SIZE,
+            None,
+        );
         assert!(t.is_err());
 
         let mut t = VhostUserVsockThread::new(
             "test_vsock_thread_failures.vsock".to_string(),
             3,
             CONN_TX_BUF_SIZE,
+            None,
         )
         .unwrap();
         assert!(VhostUserVsockThread::epoll_register(-1, -1, epoll::Events::EPOLLIN).is_err());
