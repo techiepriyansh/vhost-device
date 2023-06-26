@@ -76,7 +76,7 @@ impl VhostUserVsockThread {
         uds_path: String,
         guest_cid: u64,
         tx_buffer_size: u32,
-        cid_map: Option<Arc<RwLock<CidMap>>>,
+        cid_map: Arc<RwLock<CidMap>>,
     ) -> Result<Self> {
         // TODO: better error handling, maybe add a param to force the unlink
         let _ = std::fs::remove_file(uds_path.clone());
@@ -660,6 +660,7 @@ impl Drop for VhostUserVsockThread {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::collections::HashMap;
     use vm_memory::GuestAddress;
     use vmm_sys_util::eventfd::EventFd;
 
@@ -674,11 +675,13 @@ mod tests {
     #[test]
     #[serial]
     fn test_vsock_thread() {
+        let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
+
         let t = VhostUserVsockThread::new(
             "test_vsock_thread.vsock".to_string(),
             3,
             CONN_TX_BUF_SIZE,
-            None,
+            cid_map,
         );
         assert!(t.is_ok());
 
@@ -734,11 +737,13 @@ mod tests {
     #[test]
     #[serial]
     fn test_vsock_thread_failures() {
+        let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
+
         let t = VhostUserVsockThread::new(
             "/sys/not_allowed.vsock".to_string(),
             3,
             CONN_TX_BUF_SIZE,
-            None,
+            cid_map.clone(),
         );
         assert!(t.is_err());
 
@@ -746,7 +751,7 @@ mod tests {
             "test_vsock_thread_failures.vsock".to_string(),
             3,
             CONN_TX_BUF_SIZE,
-            None,
+            cid_map,
         )
         .unwrap();
         assert!(VhostUserVsockThread::epoll_register(-1, -1, epoll::Events::EPOLLIN).is_err());

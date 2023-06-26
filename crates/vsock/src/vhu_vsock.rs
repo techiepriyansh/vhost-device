@@ -219,7 +219,7 @@ pub(crate) struct VhostUserVsockBackend {
 }
 
 impl VhostUserVsockBackend {
-    pub fn new(config: VsockConfig, cid_map: Option<Arc<RwLock<CidMap>>>) -> Result<Self> {
+    pub fn new(config: VsockConfig, cid_map: Arc<RwLock<CidMap>>) -> Result<Self> {
         let thread = Mutex::new(VhostUserVsockThread::new(
             config.get_uds_path(),
             config.get_guest_cid(),
@@ -369,7 +369,9 @@ mod tests {
             CONN_TX_BUF_SIZE,
         );
 
-        let backend = VhostUserVsockBackend::new(config, None);
+        let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let backend = VhostUserVsockBackend::new(config, cid_map);
 
         assert!(backend.is_ok());
         let backend = backend.unwrap();
@@ -442,7 +444,9 @@ mod tests {
             CONN_TX_BUF_SIZE,
         );
 
-        let backend = VhostUserVsockBackend::new(config, None);
+        let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let backend = VhostUserVsockBackend::new(config, cid_map.clone());
         assert!(backend.is_err());
 
         let config = VsockConfig::new(
@@ -452,7 +456,7 @@ mod tests {
             CONN_TX_BUF_SIZE,
         );
 
-        let backend = VhostUserVsockBackend::new(config, None).unwrap();
+        let backend = VhostUserVsockBackend::new(config, cid_map).unwrap();
         let mem = GuestMemoryAtomic::new(
             GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
         );

@@ -177,14 +177,14 @@ impl TryFrom<VsockArgs> for Vec<VsockConfig> {
 
 /// This is the public API through which an external program starts the
 /// vhost-user-vsock backend server.
-pub(crate) fn start_backend_server(config: VsockConfig, cid_map: Option<Arc<RwLock<CidMap>>>) {
+pub(crate) fn start_backend_server(config: VsockConfig, cid_map: Arc<RwLock<CidMap>>) {
     loop {
         let backend =
             Arc::new(VhostUserVsockBackend::new(config.clone(), cid_map.clone()).unwrap());
-        if cid_map.is_some() {
-            let mut cid_map = cid_map.as_ref().unwrap().write().unwrap();
-            cid_map.insert(config.get_guest_cid(), backend.clone());
-        }
+        cid_map
+            .write()
+            .unwrap()
+            .insert(config.get_guest_cid(), backend.clone());
 
         let listener = Listener::new(config.get_socket_path(), true).unwrap();
 
@@ -220,16 +220,12 @@ pub(crate) fn start_backend_server(config: VsockConfig, cid_map: Option<Arc<RwLo
 
         // No matter the result, we need to shut down the worker thread.
         backend.exit_event.write(1).unwrap();
-        if cid_map.is_some() {
-            let mut cid_map = cid_map.as_ref().unwrap().write().unwrap();
-            cid_map.remove(&config.get_guest_cid());
-        }
+        cid_map.write().unwrap().remove(&config.get_guest_cid());
     }
 }
 
 pub(crate) fn start_backend_servers(configs: &[VsockConfig]) {
-    let cid_map: Arc<RwLock<HashMap<u64, Arc<VhostUserVsockBackend>>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
     let mut handles = Vec::new();
 
     for c in configs.iter() {
@@ -237,7 +233,7 @@ pub(crate) fn start_backend_servers(configs: &[VsockConfig]) {
         let cid_map = cid_map.clone();
         let handle = thread::Builder::new()
             .name(format!("vhu-vsock-cid-{}", c.get_guest_cid()))
-            .spawn(move || start_backend_server(config, Some(cid_map)))
+            .spawn(move || start_backend_server(config, cid_map))
             .unwrap();
         handles.push(handle);
     }
@@ -250,7 +246,7 @@ pub(crate) fn start_backend_servers(configs: &[VsockConfig]) {
 fn main() {
     env_logger::init();
 
-    let mut configs = match Vec::<VsockConfig>::try_from(VsockArgs::parse()) {
+    let configs = match Vec::<VsockConfig>::try_from(VsockArgs::parse()) {
         Ok(c) => c,
         Err(e) => {
             println!("Error parsing arguments: {}", e);
@@ -258,11 +254,7 @@ fn main() {
         }
     };
 
-    if configs.len() == 1 {
-        start_backend_server(configs.pop().unwrap(), None);
-    } else {
-        start_backend_servers(&configs);
-    }
+    start_backend_servers(&configs);
 }
 
 #[cfg(test)]
@@ -388,7 +380,10 @@ mod tests {
             CONN_TX_BUF_SIZE,
         );
 
-        let backend = Arc::new(VhostUserVsockBackend::new(config.clone(), None).unwrap());
+        let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let backend = Arc::new(VhostUserVsockBackend::new(config, cid_map.clone()).unwrap());
+        cid_map.write().unwrap().insert(CID, backend.clone());
 
         let daemon = VhostUserDaemon::new(
             String::from("vhost-user-vsock"),
@@ -402,25 +397,6 @@ mod tests {
         // VhostUserVsockBackend support a single thread that handles the TX and RX queues
         assert_eq!(backend.threads.len(), 1);
 
-        assert_eq!(vring_workers.len(), backend.threads.len());
-
-        // Now test with cid_map
-        let cid_map: Arc<RwLock<HashMap<u64, Arc<VhostUserVsockBackend>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-
-        let backend = Arc::new(VhostUserVsockBackend::new(config, Some(cid_map.clone())).unwrap());
-        cid_map.write().unwrap().insert(CID, backend.clone());
-
-        let daemon = VhostUserDaemon::new(
-            String::from("vhost-user-vsock"),
-            backend.clone(),
-            GuestMemoryAtomic::new(GuestMemoryMmap::new()),
-        )
-        .unwrap();
-
-        let vring_workers = daemon.get_epoll_handlers();
-
-        assert_eq!(backend.threads.len(), 1);
         assert_eq!(vring_workers.len(), backend.threads.len());
     }
 }
